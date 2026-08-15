@@ -105,6 +105,123 @@ func TestNormalizeFunctionArgumentsFollowsLocalRefs(t *testing.T) {
 	}
 }
 
+func TestNormalizeFunctionArgumentsCoercesNumberStrings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"filePath": map[string]any{"type": "string"},
+			"offset":   map[string]any{"type": "number"},
+		},
+	}
+	arguments := `{"filePath":"big.js","offset":"2900.0"}`
+	normalized, changed := normalizeFunctionArguments(arguments, schema)
+	if !changed {
+		t.Fatal("expected quoted numeric string to be normalized")
+	}
+	if normalized != `{"filePath":"big.js","offset":2900.0}` {
+		t.Fatalf("normalized arguments = %s", normalized)
+	}
+}
+
+func TestNormalizeFunctionArgumentsCoercesIntegerStrings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"timeout_ms": map[string]any{"type": "integer"},
+		},
+	}
+	arguments := `{"timeout_ms":"60000.0"}`
+	normalized, changed := normalizeFunctionArguments(arguments, schema)
+	if !changed {
+		t.Fatal("expected quoted numeric string to be normalized")
+	}
+	if normalized != `{"timeout_ms":60000}` {
+		t.Fatalf("normalized arguments = %s", normalized)
+	}
+}
+
+func TestNormalizeFunctionArgumentsPreservesNonNumericStrings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"filePath": map[string]any{"type": "string"},
+			"offset":   map[string]any{"type": "number"},
+			"note":     map[string]any{"type": "string"},
+		},
+	}
+	arguments := `{"filePath":"big.js","offset":"0x1A","note":"2900.0"}` // hex is not JSON; string stays quoted
+	normalized, changed := normalizeFunctionArguments(arguments, schema)
+	if changed {
+		t.Fatalf("non-numeric content changed: %s", normalized)
+	}
+	if normalized != arguments {
+		t.Fatalf("arguments mutated: %s", normalized)
+	}
+}
+
+func TestSchemaContainsNumberDetectsNumberTypes(t *testing.T) {
+	numberOnly := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"offset": map[string]any{"type": "number"}},
+	}
+	if !schemaContainsNumber(numberOnly) {
+		t.Fatal("number-typed property was not detected")
+	}
+	if schemaContainsInteger(numberOnly) {
+		t.Fatal("number-typed property falsely detected as integer")
+	}
+	unionWithString := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"value": map[string]any{"type": []any{"number", "string"}}},
+	}
+	if schemaContainsNumber(unionWithString) {
+		t.Fatal("union with string should not arm normalization")
+	}
+}
+
+func TestNormalizeFunctionArgumentsNumberStringInStream(t *testing.T) {
+	request := []byte(`{
+		"model":"public",
+		"stream":true,
+		"tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"number"}}}}]
+	}`)
+	_, compatibility, err := normalizeResponsesRequest(request, "grok-4.6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil {
+		t.Fatal("number schema did not enable response compatibility")
+	}
+	stream := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":""}}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"filePath\":\"big.js\",\"offset\":\"2900"}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":".0\"}"}`,
+		``,
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"filePath\":\"big.js\",\"offset\":\"2900.0\"}"}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"filePath\":\"big.js\",\"offset\":\"2900.0\"}"}}`,
+		``,
+	}, "\n")
+	body, err := io.ReadAll(compatibility.normalizeResponseStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if strings.Contains(text, `\"offset\":\"2900.0\"`) {
+		t.Fatalf("stream retained quoted numeric string: %s", text)
+	}
+	if !strings.Contains(text, `\"offset\":2900.0`) {
+		t.Fatalf("normalized numeric string missing: %s", text)
+	}
+}
+
 func TestResponsesIntegerArgumentsNormalizedInJSONResponse(t *testing.T) {
 	request := []byte(`{
 		"model":"public",
@@ -273,5 +390,109 @@ func TestResponsesIntegerArgumentsBufferOverflowFallsBackToStreaming(t *testing.
 	state := compatibility.streamCalls["fc_1"]
 	if state == nil || !state.passthrough || state.arguments.Len() != 0 || compatibility.streamArgumentBytes != 0 {
 		t.Fatal("overflow did not release the buffered arguments")
+	}
+}
+
+func TestNewToolCompatibilityFromBuildBodyHarvestsNumberSchemas(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[
+			{"type":"function","name":"read","description":"Read a file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"integer"}}}},
+			{"type":"function","name":"edit","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"}}}},
+			{"type":"web_search"}
+		]
+	}`)
+	compatibility := newToolCompatibilityFromBuildBody(body)
+	if compatibility == nil {
+		t.Fatal("number schemas did not enable response compatibility")
+	}
+	if len(compatibility.functionSchemas) != 1 {
+		t.Fatalf("functionSchemas = %d, want 1", len(compatibility.functionSchemas))
+	}
+	schema, ok := compatibility.functionSchemas["read"]
+	if !ok {
+		t.Fatal("read schema not harvested")
+	}
+	properties := schema.(map[string]any)["properties"].(map[string]any)
+	if _, exists := properties["offset"]; !exists {
+		t.Fatal("offset property missing from harvested schema")
+	}
+	if identity, exists := compatibility.aliases["read"]; !exists || identity.Name != "read" || identity.Kind != responsesFunctionTool {
+		t.Fatalf("aliases[read] = %+v", identity)
+	}
+	// string-only tools must not arm normalization
+	if _, exists := compatibility.functionSchemas["edit"]; exists {
+		t.Fatal("edit schema must not be harvested")
+	}
+	if bodyOnlyTools := newToolCompatibilityFromBuildBody([]byte(`{"tools":[{"type":"function","name":"only_string","parameters":{"type":"object","properties":{"note":{"type":"string"}}}}]}`)); bodyOnlyTools != nil {
+		t.Fatal("string-only tools must not enable compatibility")
+	}
+}
+
+func TestChatPathNumberStringArgumentsNormalizedInStream(t *testing.T) {
+	// Simulates the conversation-converted Build body that the adapter forwards
+	// for chat/completions requests (opencode uses this path, not /responses).
+	body := []byte(`{
+		"model":"grok-4.6",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"read"}]}],
+		"tools":[{"type":"function","name":"read","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}}}}]
+	}`)
+	compatibility := newToolCompatibilityFromBuildBody(body)
+	if compatibility == nil {
+		t.Fatal("number schema did not enable response compatibility")
+	}
+	stream := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":""}}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"filePath\":\"/tmp/opencode-test/big.js\",\"offset\":\"2900"}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":".0\",\"limit\":1}"}`,
+		``,
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"filePath\":\"/tmp/opencode-test/big.js\",\"offset\":\"2900.0\",\"limit\":1}"}`,
+		``,
+	}, "\n")
+	output, err := io.ReadAll(compatibility.normalizeResponseStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(output)
+	if strings.Contains(text, `\"offset\":\"2900.0\"`) {
+		t.Fatalf("stream retained quoted numeric string: %s", text)
+	}
+	if !strings.Contains(text, `\"offset\":2900.0`) {
+		t.Fatalf("stream missing unquoted number: %s", text)
+	}
+	if strings.Contains(text, `\"limit\":\"1\"`) || !strings.Contains(text, `\"limit\":1`) {
+		t.Fatalf("integer argument not normalized: %s", text)
+	}
+}
+
+func TestChatPathNumberStringArgumentsNormalizedInJSON(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"read"}]}],
+		"tools":[{"type":"function","name":"read","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"number"}}}}]
+	}`)
+	compatibility := newToolCompatibilityFromBuildBody(body)
+	if compatibility == nil {
+		t.Fatal("number schema did not enable response compatibility")
+	}
+	response, err := compatibility.normalizeResponseJSON([]byte(`{
+		"id":"resp_1","object":"response",
+		"output":[{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"filePath\":\"/tmp/opencode-test/big.js\",\"offset\":\"2900.0\"}"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(response), `\"offset\":\"2900.0\"`) {
+		t.Fatalf("JSON retained quoted numeric string: %s", response)
+	}
+	if !strings.Contains(string(response), `\"offset\":2900.0`) {
+		t.Fatalf("JSON missing unquoted number: %s", response)
 	}
 }

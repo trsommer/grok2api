@@ -75,6 +75,56 @@ func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesTool
 	return compatibility, nil
 }
 
+// newToolCompatibilityFromBuildBody harvests function schemas from a
+// Build-shaped request body as produced by the conversation converter for
+// chat/messages operations. Unlike normalizeResponsesRequest it never rewrites
+// the request: tool names are preserved verbatim and only the schema map is
+// retained so function-call arguments can be normalized on the response side.
+// Returns nil when no declared function parameter uses a numeric type.
+func newToolCompatibilityFromBuildBody(body []byte) *responsesToolCompatibility {
+	var payload struct {
+		Tools []map[string]json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	compatibility := newResponsesToolCompatibility()
+	for _, tool := range payload.Tools {
+		var typeName string
+		_ = json.Unmarshal(tool["type"], &typeName)
+		if typeName != "function" {
+			continue
+		}
+		var name string
+		if json.Unmarshal(tool["name"], &name) != nil || strings.TrimSpace(name) == "" {
+			continue
+		}
+		parameters, exists := tool["parameters"]
+		if !exists || isEmptyJSON(parameters) {
+			parameters = tool["input_schema"]
+			if isEmptyJSON(parameters) {
+				continue
+			}
+		}
+		var schema map[string]any
+		if json.Unmarshal(parameters, &schema) != nil {
+			continue
+		}
+		if !schemaContainsNumber(schema) {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		identity := responsesToolIdentity{Kind: responsesFunctionTool, Name: name}
+		compatibility.aliases[name] = identity
+		compatibility.identityAliases[identity.key()] = name
+		compatibility.functionSchemas[name] = schema
+	}
+	if len(compatibility.functionSchemas) == 0 {
+		return nil
+	}
+	return compatibility
+}
+
 // normalizeClientToolSearchParallel 保证搜索函数先独立完成，再由客户端选择并回传工具定义。
 func (c *responsesToolCompatibility) normalizeClientToolSearchParallel(payload map[string]json.RawMessage, clientSearch bool) error {
 	if !clientSearch {
@@ -184,7 +234,7 @@ func (c *responsesToolCompatibility) normalizeTool(raw any, namespace string, cl
 		}
 		identity := responsesToolIdentity{Kind: responsesFunctionTool, Namespace: namespace, Name: name}
 		alias := c.alias(identity)
-		if parameters, exists := tool["parameters"]; exists && schemaContainsInteger(parameters) {
+		if parameters, exists := tool["parameters"]; exists && schemaContainsNumber(parameters) {
 			c.functionSchemas[alias] = cloneJSONValue(parameters)
 		}
 		converted["name"] = alias

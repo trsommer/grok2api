@@ -223,6 +223,11 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
+			if err == nil {
+				// 对话协议同样需要修复上游数值字符串参数（如 "offset":"2900.0"），
+				// 但工具名保持原样，仅收集带数值类型的函数 schema 用于响应侧归一化。
+				toolCompatibility = newToolCompatibilityFromBuildBody(body)
+			}
 		} else {
 			var foreignCompactions int
 			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
@@ -408,6 +413,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	}
 	if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 		if request.Streaming && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if toolCompatibility != nil {
+				resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
+			}
 			resp.Body = conversation.ConvertResponseStreamWithOptions(resp.Body, request.Operation, conversationOptions)
 			resp.Header.Del("Content-Length")
 			resp.Header.Set("Content-Type", "text/event-stream")
@@ -430,6 +438,12 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			var diagnostic *provider.DiagnosticResponse
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				diagnostic = &provider.DiagnosticResponse{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data, BodyTruncated: diagnosticTruncated || rateLimitDiagnostic != nil}
+			} else if toolCompatibility != nil {
+				normalized, normalizeErr := toolCompatibility.normalizeResponseJSON(data)
+				if normalizeErr != nil {
+					return nil, normalizeErr
+				}
+				data = normalized
 			}
 			converted, convertErr := conversation.ConvertResponseJSONWithOptions(data, request.Operation, conversationOptions)
 			if convertErr != nil {
