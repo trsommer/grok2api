@@ -110,6 +110,24 @@ const (
 	AuthStatusReauthRequired AuthStatus = "reauthRequired"
 )
 
+// LastErrorMissingThinking values are durable, non-sensitive quality strike
+// markers. Unlike arbitrary upstream errors, they may be propagated through
+// runtime invalidation events so every gateway instance preserves the strike.
+const (
+	LastErrorMissingThinking         = "missing_thinking"
+	LastErrorMissingThinkingDisabled = "missing_thinking_disabled"
+)
+
+// NormalizeHealthMarker admits only durable non-sensitive health markers.
+func NormalizeHealthMarker(value string) string {
+	switch value {
+	case LastErrorMissingThinking, LastErrorMissingThinkingDisabled:
+		return value
+	default:
+		return ""
+	}
+}
+
 // EgressAssignmentMode 表示账号出口节点的维护方式。手工绑定绝不会被
 // 自动均衡任务迁移，自动绑定才允许在健康或容量变化时重新分配。
 type EgressAssignmentMode string
@@ -141,13 +159,16 @@ type Credential struct {
 	RefreshDueAt              *time.Time
 	LastRefreshAt             *time.Time
 	RefreshFailureCount       int
-	LastRefreshErrorStatus    int
-	LastRefreshErrorCode      string
-	LastRefreshErrorMessage   string
-	LastRefreshErrorResponse  string
-	RefreshPermanent          bool
-	Enabled                   bool
-	AuthStatus                AuthStatus
+	// RefreshUnclassifiedAuthCount counts consecutive OAuth 400/401 rejections
+	// that cannot be classified from a machine-readable error code.
+	RefreshUnclassifiedAuthCount int
+	LastRefreshErrorStatus       int
+	LastRefreshErrorCode         string
+	LastRefreshErrorMessage      string
+	LastRefreshErrorResponse     string
+	RefreshPermanent             bool
+	Enabled                      bool
+	AuthStatus                   AuthStatus
 	// ReauthMarkedAt 仅在切入 reauthRequired 时写入；恢复 active 时清空。自动清理以该时刻为 minAge 锚点。
 	ReauthMarkedAt   *time.Time
 	Priority         int
@@ -206,23 +227,24 @@ type Credential struct {
 // CredentialMaterial contains the encrypted provider secrets and refresh
 // metadata loaded only after routing selects an account.
 type CredentialMaterial struct {
-	AccountID                 uint64
-	Provider                  Provider
-	AuthType                  AuthType
-	OIDCClientID              string
-	EncryptedAccessToken      string
-	EncryptedRefreshToken     string
-	EncryptedCloudflareCookie string
-	ExpiresAt                 time.Time
-	RefreshDueAt              *time.Time
-	LastRefreshAt             *time.Time
-	RefreshFailureCount       int
-	LastRefreshErrorStatus    int
-	LastRefreshErrorCode      string
-	LastRefreshErrorMessage   string
-	LastRefreshErrorResponse  string
-	RefreshPermanent          bool
-	UpdatedAt                 time.Time
+	AccountID                    uint64
+	Provider                     Provider
+	AuthType                     AuthType
+	OIDCClientID                 string
+	EncryptedAccessToken         string
+	EncryptedRefreshToken        string
+	EncryptedCloudflareCookie    string
+	ExpiresAt                    time.Time
+	RefreshDueAt                 *time.Time
+	LastRefreshAt                *time.Time
+	RefreshFailureCount          int
+	RefreshUnclassifiedAuthCount int
+	LastRefreshErrorStatus       int
+	LastRefreshErrorCode         string
+	LastRefreshErrorMessage      string
+	LastRefreshErrorResponse     string
+	RefreshPermanent             bool
+	UpdatedAt                    time.Time
 }
 
 // ApplyTo merges credential material into the matching routing account.
@@ -241,6 +263,7 @@ func (m CredentialMaterial) ApplyTo(value Credential) (Credential, bool) {
 	value.RefreshDueAt = m.RefreshDueAt
 	value.LastRefreshAt = m.LastRefreshAt
 	value.RefreshFailureCount = m.RefreshFailureCount
+	value.RefreshUnclassifiedAuthCount = m.RefreshUnclassifiedAuthCount
 	value.LastRefreshErrorStatus = m.LastRefreshErrorStatus
 	value.LastRefreshErrorCode = m.LastRefreshErrorCode
 	value.LastRefreshErrorMessage = m.LastRefreshErrorMessage
@@ -420,6 +443,7 @@ type RoutingCandidate struct {
 	Billing              *Billing
 	QuotaWindow          *QuotaWindow
 	QuotaRecovery        *QuotaRecovery
+	EgressLeaseBlock     *EgressLeaseBlock
 	ModelQuotaBlock      *ModelQuotaBlock
 	ModelCapabilityKnown bool
 	SupportsModel        bool
@@ -428,10 +452,11 @@ type RoutingCandidate struct {
 // RoutingAccountBase contains provider-level routing state reusable across
 // models. Credential material is hydrated only after an account is selected.
 type RoutingAccountBase struct {
-	Credential    Credential
-	Billing       *Billing
-	QuotaRecovery *QuotaRecovery
-	QuotaWindow   *QuotaWindow
+	Credential       Credential
+	Billing          *Billing
+	QuotaRecovery    *QuotaRecovery
+	QuotaWindow      *QuotaWindow
+	EgressLeaseBlock *EgressLeaseBlock
 }
 
 // RoutingAccountOverlay contains model-specific eligibility state.
@@ -455,6 +480,26 @@ type ModelQuotaBlock struct {
 	Reason        string
 	CooldownUntil time.Time
 	UpdatedAt     time.Time
+}
+
+// EgressLeaseBlock temporarily removes one account-bound proxy lease from
+// routing without changing the account's health or disabling the physical
+// egress node shared by other leases.
+type EgressLeaseBlock struct {
+	AccountID     uint64
+	NodeID        uint64
+	Reason        string
+	Version       string
+	CooldownUntil time.Time
+	UpdatedAt     time.Time
+}
+
+// EgressLeaseBlockCursor is the stable keyset position used to scan durable
+// lease state while rows may be renewed or removed concurrently.
+type EgressLeaseBlockCursor struct {
+	CooldownUntil time.Time
+	AccountID     uint64
+	NodeID        uint64
 }
 
 // DeviceSession 表示一次短期 Device OAuth 授权流程。
@@ -513,12 +558,15 @@ func normalizeBillingPlan(value string) string {
 }
 
 func isPaidBillingPlan(value string) bool {
-	switch normalizeBillingPlan(value) {
-	case "super", "supergrok", "supergrokpro", "supergrokheavy", "supergroklite",
+	normalized := normalizeBillingPlan(value)
+	switch normalized {
+	case "super", "supergrok", "supergrokpro", "supergrokheavy", "supergroklite", "supergrokplus",
 		"grokpro", "xpremium", "xpremiumplus", "apikey":
 		return true
 	default:
-		return false
+		// SuperGrok Plus and later SuperGrok* tiers should stay paid even when
+		// weekly numeric limits are zero and the exact plan name is new.
+		return strings.HasPrefix(normalized, "supergrok")
 	}
 }
 

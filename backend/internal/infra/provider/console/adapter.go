@@ -21,6 +21,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 	providerstreamidle "github.com/chenyme/grok2api/backend/internal/infra/provider/streamidle"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 type Config struct {
@@ -101,6 +102,9 @@ func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, 
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	if request.NormalizedMetadata != nil {
+		*request.NormalizedMetadata = provider.NormalizedRequestMetadata{}
+	}
 	if request.Method != http.MethodPost || request.Path != "/responses" {
 		return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"type": "invalid_request_error", "message": "Grok Console 仅支持 POST /responses"}}), nil
 	}
@@ -117,11 +121,14 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
+			if err == nil && conversationOptions.ReasoningEffortSet && request.NormalizedMetadata != nil {
+				request.NormalizedMetadata.ReasoningEffort = conversationOptions.ReasoningEffort
+			}
 		} else {
 			body, err = conversation.ConvertRequest(body, request.Model, request.Operation)
 		}
 		if err == nil {
-			body, err = normalizeRequest(body, spec)
+			body, err = normalizeRequestWithMetadata(body, spec, request.NormalizedMetadata)
 		}
 		if err != nil {
 			return invalidConversationResponse(request.Operation, err), nil
@@ -130,7 +137,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	cfg := a.config()
 	requestCtx, totalCancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	var idleCancel context.CancelCauseFunc
-	if request.Streaming && cfg.StreamIdleTimeoutSeconds > 0 {
+	if cfg.StreamIdleTimeoutSeconds > 0 {
 		requestCtx, idleCancel = context.WithCancelCause(requestCtx)
 	}
 	cancel := func() {
@@ -151,7 +158,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		cancel()
 		return nil, err
 	}
-	if request.Streaming && idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
+	if idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
 		response.Body = providerstreamidle.New(response.Body, time.Duration(cfg.StreamIdleTimeoutSeconds)*time.Second, idleCancel)
 	}
 	responseBodyTruncated := false
@@ -219,6 +226,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		release()
 		if readErr != nil {
 			return nil, readErr
+		}
+		if response.StatusCode >= 200 && response.StatusCode < 300 && len(bytes.TrimSpace(data)) == 0 {
+			return nil, neterrorpkg.ErrUpstreamResponseEmpty
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 && len(data) > 64<<20 {
 			return nil, fmt.Errorf("Console 对话响应超过 64 MiB")

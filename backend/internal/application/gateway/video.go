@@ -22,6 +22,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 )
 
 const (
@@ -121,6 +122,26 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 			}
 		}
 	}
+	routes, err := s.models.GetByPublicIDCandidates(ctx, input.PublicModel)
+	if err != nil {
+		return media.Job{}, ErrModelNotFound
+	}
+	routes, err = routesForVideoOperation(routes, operation)
+	if err != nil {
+		return media.Job{}, err
+	}
+	providerSupported := func(providerValue account.Provider) bool {
+		_, ok := s.providers.Videos(providerValue)
+		return ok
+	}
+	routes, _, err = s.eligibleMediaRoutes(routes, input.ClientKey, model.CapabilityVideo, providerSupported)
+	if err != nil {
+		return media.Job{}, err
+	}
+	routes, err = routesForVideoParameters(routes, operation, input.Resolution, strings.TrimSpace(input.ImageURL) != "", len(input.ReferenceURLs), input.Duration)
+	if err != nil {
+		return media.Job{}, err
+	}
 	allRefs := videoInputReferences(input.ImageURL, input.ReferenceURLs)
 	if err := s.validateVideoInputReferences(ctx, allRefs, "image"); err != nil {
 		return media.Job{}, err
@@ -134,24 +155,10 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, err
 	}
-	routes, err := s.models.GetByPublicIDCandidates(ctx, input.PublicModel)
-	if err != nil {
-		return media.Job{}, ErrModelNotFound
-	}
-	routes, err = routesForVideoOperation(routes, operation)
-	if err != nil {
-		return media.Job{}, err
-	}
-	route, selection, err := s.selectSchedulableMediaRouteWithQuotaMode(ctx, routes, input.ClientKey, model.CapabilityVideo, true, func(providerValue account.Provider) bool {
-		_, ok := s.providers.Videos(providerValue)
-		return ok
-	}, func(route model.Route) string {
+	route, selection, err := s.selectSchedulableEligibleMediaRouteWithQuotaMode(ctx, routes, input.ClientKey, true, func(route model.Route) string {
 		return videoQuotaMode(route.Provider, s.providers.QuotaMode(route.Provider, route.UpstreamModel), input.Resolution)
 	})
 	if err != nil {
-		return media.Job{}, err
-	}
-	if err := validateVideoRouteParameters(operation, route.UpstreamModel, input.Resolution, len(input.ReferenceURLs) > 0); err != nil {
 		return media.Job{}, err
 	}
 	if err := s.checkLedgerReady(); err != nil {
@@ -173,6 +180,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	job := media.Job{
 		ID: "video_" + token, RequestID: input.RequestID,
 		ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
+		ClientIP:  requestmeta.ClientIP(ctx),
 		AccountID: accountID, AccountName: lease.Credential.Name,
 		Provider: string(route.Provider), Model: externalModel, ModelRouteID: route.ID, UpstreamModel: model.DisplayUpstreamModel(route.Provider, route.UpstreamModel), Operation: operation, Prompt: input.Prompt,
 		Seconds: input.Duration, Size: input.AspectRatio, Quality: input.Resolution,
@@ -197,11 +205,60 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	return job, nil
 }
 
-func validateVideoRouteParameters(operation provider.VideoOperation, upstreamModel, resolution string, hasReferences bool) error {
-	if operation != provider.VideoOperationGenerate || !strings.EqualFold(strings.TrimSpace(resolution), "1080p") {
+// routesForVideoParameters removes only routes that cannot accept this request.
+// Callers must first apply capability, client-key, and Provider eligibility:
+// the same public model may aggregate Console, Build, and Web routes with
+// different input contracts.
+func routesForVideoParameters(routes []model.Route, operation provider.VideoOperation, resolution string, hasImage bool, referenceCount, duration int) ([]model.Route, error) {
+	if len(routes) == 0 {
+		return routes, nil
+	}
+	compatible := make([]model.Route, 0, len(routes))
+	var firstErr error
+	for _, candidate := range routes {
+		if err := validateVideoRouteParameters(candidate.Provider, operation, candidate.UpstreamModel, resolution, hasImage, referenceCount, duration); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		compatible = append(compatible, candidate)
+	}
+	if len(compatible) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return compatible, nil
+}
+
+// Console 视频输入的上限与时长按「Provider + 入口字段 + 上游模型」分档。
+// /v1/videos/generations 是异步接口，只在 adapter 层拦截会产出必然失败的任务；
+// adapter 仍保留同一约束，作为最终出站边界的防御校验。
+func validateVideoRouteParameters(providerValue account.Provider, operation provider.VideoOperation, upstreamModel, resolution string, hasImage bool, referenceCount, duration int) error {
+	if operation != provider.VideoOperationGenerate {
 		return nil
 	}
-	if strings.TrimSpace(upstreamModel) != "grok-imagine-video-1.5" {
+	trimmedModel := strings.TrimSpace(upstreamModel)
+	hasReferences := referenceCount > 0
+	if providerValue == account.ProviderWeb && (hasImage || hasReferences) {
+		return fmt.Errorf("%w: Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider", ErrVideoOperationUnsupported)
+	}
+	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
+		// 实测：8 张 reference_images 上游回 400
+		// "Too many reference images: 8. Maximum allowed is 7."（两个视频模型一致）。
+		if referenceCount > provider.ConsoleVideoMaxReferenceImages {
+			return fmt.Errorf("%w: Console reference_images 最多 %d 张，当前为 %d 张", ErrVideoParameterInvalid, provider.ConsoleVideoMaxReferenceImages, referenceCount)
+		}
+		// 实测：grok-imagine-video 的 reference-to-video 上游回 400
+		// "Duration 15s exceeds the maximum allowed for reference-to-video, which is 10s."；
+		// 走 image 字段的 image-to-video 与 grok-imagine-video-1.5 都保持 15s。
+		if trimmedModel == "grok-imagine-video" && hasReferences && duration > provider.ConsoleVideoMaxReferenceDurationSeconds {
+			return fmt.Errorf("%w: Console %s 的参考图生视频最长 %d 秒，当前为 %d 秒", ErrVideoParameterInvalid, trimmedModel, provider.ConsoleVideoMaxReferenceDurationSeconds, duration)
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(resolution), "1080p") {
+		return nil
+	}
+	if trimmedModel != "grok-imagine-video-1.5" {
 		return fmt.Errorf("%w: %s 不支持 1080p", ErrVideoOperationUnsupported, upstreamModel)
 	}
 	if hasReferences {
@@ -612,11 +669,8 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				failureHandled = true
 				retriableCreate = safeCreateFailure && !account.IsBuildSuper(lease.Credential, lease.Billing)
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
-				s.selector.MarkQuotaStateChanged(lease.Credential.Provider, lease.Credential.ID)
-				if reconcileErr != nil || !exhausted {
-					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
-				}
+				state, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
+				s.applyRateLimitReconciliation(failureCtx, lease.Credential, status, 0, state, reconcileErr)
 				failureHandled = true
 				retriableCreate = safeCreateFailure
 			case status == http.StatusTooManyRequests || status == http.StatusPaymentRequired:
@@ -684,12 +738,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		return
 	}
 	s.selector.MarkSuccess(context.Background(), lease.Credential)
-	refreshMode := lease.QuotaMode
-	decrementMode := lease.QuotaMode
-	if quotaRefreshGroup != "" {
-		refreshMode = quotaRefreshGroup
-		decrementMode = quotaMode
-	}
+	refreshMode, decrementMode, availabilityMode := quotaFinalizationModes(lease.QuotaMode, quotaRefreshGroup)
 	if decrementMode != "" && decrementMode != "weekly" {
 		quotaCtx, quotaCancel := context.WithTimeout(context.Background(), accountStateWriteTimeout)
 		updated, quotaErr := s.accounts.DecrementQuota(quotaCtx, job.AccountID, decrementMode, 1)
@@ -705,6 +754,9 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}
 	if quotaKind, _ := s.providers.QuotaKind(route.Provider); quotaKind == provider.QuotaRemoteWindow && refreshMode != "" {
 		s.accounts.QueueQuotaRefresh(job.AccountID, refreshMode)
+		if availabilityMode != "" && availabilityMode != refreshMode {
+			s.accounts.QueueQuotaRefresh(job.AccountID, availabilityMode)
+		}
 	}
 	// 输入回收放在账号状态、计费和审计收尾之后，存储抖动不得延迟关键终态逻辑。
 	s.releaseVideoInputs(job)
@@ -938,12 +990,14 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 	statusCode := resolveVideoAuditStatusCode(job, upstreamStatus, attempts)
 	record := audit.Record{
 		EventID: "video_usage_" + job.ID, RequestID: job.RequestID, ClientKeyID: job.ClientKeyID, ClientKeyName: job.ClientKeyName,
+		ClientIP:     job.ClientIP,
 		ModelRouteID: job.ModelRouteID, ModelPublicID: job.Model, ModelUpstreamModel: job.UpstreamModel,
 		Provider: job.Provider, Operation: audit.OperationVideo, UsageSource: audit.UsageSourceNone,
 		AccountID: accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
 		MediaInputImages: int64(job.InputImageCount),
 		DurationMS:       durationMS, AttemptCount: len(attempts), Attempts: append([]audit.Attempt(nil), attempts...), CreatedAt: createdAt,
+		RequestMethod: http.MethodPost, RequestPath: "/v1/videos/generations",
 	}
 	if job.Status == media.StatusCompleted && job.Seconds > 0 {
 		record.MediaOutputSeconds = int64(max(0, job.Seconds))

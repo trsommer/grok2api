@@ -32,6 +32,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -44,6 +45,7 @@ var (
 	ErrConversationUnsupported    = errors.New("目标模型不支持当前对话协议")
 	ErrVideoInputTooLarge         = errors.New("视频参考图片编码后总输入超过 32 MiB")
 	ErrVideoInputUnavailable      = errors.New("视频临时输入不存在或已过期")
+	ErrVideoParameterInvalid      = errors.New("视频请求参数无效")
 	ErrVideoOperationUnsupported  = errors.New("视频编辑/延长仅支持路由到 Console grok-imagine-video")
 	ErrLedgerUnavailable          = errors.New("计费账本暂不可用")
 )
@@ -70,6 +72,13 @@ func newRoutingAttemptPolicy(configured int) routingAttemptPolicy {
 		configured = 3
 	}
 	return routingAttemptPolicy{limit: configured}
+}
+
+func newRequestRoutingAttemptPolicy(configured int, pinned bool) routingAttemptPolicy {
+	if pinned {
+		return newRoutingAttemptPolicy(1)
+	}
+	return newRoutingAttemptPolicy(configured)
 }
 
 func (p routingAttemptPolicy) allows(attempt int) bool {
@@ -106,12 +115,31 @@ type Input struct {
 	// GrokTurnIndex forwards only the turn supplied by a real Grok Shell client; the server never infers or increments it.
 	GrokTurnIndex string
 	Operation     audit.Operation
+	Method        string
+	Path          string
+	Headers       map[string][]string
+	// auditOperation may classify a normal protocol request differently for
+	// operator visibility without changing routing or Provider semantics.
+	auditOperation audit.Operation
+	// skipQualityHold is set only by trusted gateway-side request classifiers.
+	skipQualityHold bool
 	// ForcedEgressNodeID is an internal-only administrator probe constraint.
 	// Public inference handlers never populate it.
 	ForcedEgressNodeID uint64
+	// ForcedAccountID is paired with ForcedEgressNodeID only by the internal
+	// Quality Guard recovery path. It never accepts public request input.
+	ForcedAccountID uint64
 }
 
 type Usage struct {
+	// Reported distinguishes a real upstream/estimated usage object from the
+	// zero value used when a response fails before usage is available. Token
+	// counts may legitimately all be zero, so the numeric fields cannot carry
+	// this presence information by themselves.
+	Reported bool
+	// OutputObserved records that the transport actually forwarded generated
+	// content even when an interrupted upstream never emitted final usage.
+	OutputObserved         bool
 	InputTokens            int64
 	CachedInputTokens      int64
 	OutputTokens           int64
@@ -199,6 +227,7 @@ type Service struct {
 	modelSyncMu                 sync.Mutex
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
+	qualityRetry                atomic.Pointer[QualityRetryRuntime]
 }
 
 type teamModelRateLimit struct {
@@ -447,7 +476,9 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 
 // UpdateVideoMaxAttempts configures create-phase account failover for video jobs.
 // 0 is treated as the general default pool size for legacy configs.
-func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) { s.videoMaxAttempts.Store(int64(maxAttempts)) }
+func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) {
+	s.videoMaxAttempts.Store(int64(maxAttempts))
+}
 
 // UpdateMarkBuildChatDeniedAsReauth 热更新 Build chat 永久拒绝是否标 reauthRequired。
 // 默认 false：仅模型级冷却；true 时按旧逻辑将账号标为失效并出池。
@@ -480,8 +511,15 @@ func (s *Service) checkLedgerReady() error {
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationResponses
-	if isResponsesCompactionRequest(input.Body) {
+	switch classifyResponsesCompactionRequest(input.Body) {
+	case responsesCompactionTrigger:
 		input.Operation = audit.OperationCompaction
+	case responsesCompactionTUI:
+		// Grok TUI compaction is still a normal Responses request. Keep its
+		// routing, Provider normalization, and stored-response behavior intact;
+		// only its audit classification and quality-hold policy differ.
+		input.auditOperation = audit.OperationCompaction
+		input.skipQualityHold = true
 	}
 	return s.createResponseAt(ctx, input, "/responses")
 }
@@ -754,6 +792,17 @@ func (s *Service) selectSchedulableMediaRouteWithQuotaMode(ctx context.Context, 
 	if err != nil {
 		return fallback, nil, err
 	}
+	return s.selectSchedulableEligibleMediaRouteWithQuotaMode(ctx, eligible, key, consumesQuota, resolveQuotaMode)
+}
+
+// selectSchedulableEligibleMediaRouteWithQuotaMode selects an account plan
+// from routes that already passed capability, client-key, and Provider support
+// checks. Callers may apply request-specific route constraints between the
+// eligibility and scheduling phases without evaluating disallowed routes.
+func (s *Service) selectSchedulableEligibleMediaRouteWithQuotaMode(ctx context.Context, eligible []modeldomain.Route, key clientkey.Key, consumesQuota bool, resolveQuotaMode func(modeldomain.Route) string) (modeldomain.Route, *selectionSession, error) {
+	if len(eligible) == 0 {
+		return modeldomain.Route{}, nil, ErrNoAvailableAccount
+	}
 	var firstSelectionErr error
 	for _, route := range eligible {
 		quotaMode := ""
@@ -802,6 +851,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	operation := input.Operation
 	if operation == "" {
 		operation = audit.OperationResponses
+	}
+	auditOperation := operation
+	if input.auditOperation != "" {
+		auditOperation = input.auditOperation
 	}
 	routes, aliasEffort, err := s.resolvePublicModelRoutes(ctx, input.PublicModel, input.ClientKey.AllowModelAliases)
 	if err != nil {
@@ -899,9 +952,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	logResponseMediaSummary(s.logger, input.RequestID, mediaSummary)
 	auditBase := audit.Record{
 		EventID: eventID, RequestID: input.RequestID, ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
+		ClientIP:     requestmeta.ClientIP(ctx),
 		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
-		Provider: string(route.Provider), Operation: operation, UsageSource: usageSource, Streaming: input.Streaming,
+		Provider: string(route.Provider), Operation: auditOperation, UsageSource: audit.UsageSourceNone, Streaming: input.Streaming,
 		MediaInputImages: mediaSummary.InputImages,
+		RequestMethod:    input.Method, RequestPath: input.Path, RequestHeaders: input.Headers,
 	}
 	if errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
 		record := auditBase
@@ -960,11 +1015,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
-	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
+	// A lease recovery probe stays on exactly one account and one rendered proxy
+	// identity. Retrying the same pinned account would provide neither failover
+	// nor new evidence and can multiply a slow/failing probe.
+	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), ownership != nil || input.ForcedAccountID != 0)
 	idempotencyID, _ := security.NewOpaqueToken(18)
-	if ownership != nil {
-		attemptPolicy = newRoutingAttemptPolicy(1)
-	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if err := s.checkLedgerReady(); err != nil {
 		return nil, err
@@ -977,18 +1032,25 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
+	holdCfg := s.qualityRetryConfig()
+	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	// Count accounts that actually reached the upstream. Credential-only skips
+	// do not consume the quality retry budget; refreshes stay on the same account.
+	qualityAccountAttempts := 0
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	selection := preselectedSession
 	var lastErr error
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
+	normalizedMetadata := &provider.NormalizedRequestMetadata{}
 	responseStartedAt := startedAt
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
 		return response, err
@@ -1000,12 +1062,189 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time) *Result {
+		accountID := credential.ID
+		var once sync.Once
+		finalize := func(usage Usage, responseID, errorCode string) {
+			once.Do(func() {
+				// HTTP 状态码保留线上真实值；流在 2xx 响应头之后失败时由 errorCode
+				// 决定最终结果，避免把协议状态与业务结果混为一谈。
+				successful := auditRequestSucceeded(response.StatusCode, errorCode)
+				lease.completeSelectorObservation(successful)
+				budget := newFinalizationBudget(string(operation), string(route.Provider))
+				if isUpstreamStreamFailure(errorCode) {
+					status, retryAfter := streamFailureHealthPenalty(errorCode, usage, s.qualityRetryConfig().IdleAccountCooldown)
+					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
+						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, status, retryAfter)
+					}); err != nil {
+						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+					}
+				}
+				lease.Release()
+				now := time.Now().UTC()
+				record := auditBase
+				if usage.Reported {
+					record.UsageSource = usageSource
+				}
+				record.AccountID = &accountID
+				record.AccountName = credential.Name
+				record.StatusCode = response.StatusCode
+				record.InputTokens = usage.InputTokens
+				record.CachedInputTokens = usage.CachedInputTokens
+				record.OutputTokens = usage.OutputTokens
+				record.ReasoningTokens = usage.ReasoningTokens
+				record.TotalTokens = usage.TotalTokens
+				record.CostInUSDTicks = usage.CostInUSDTicks
+				imagePricing, imagePriced := audit.EstimateOfficialImageCost(pricingModel, "", "", response.QuotaUnits)
+				if imagePriced {
+					record.MediaOutputImages = int64(max(0, response.QuotaUnits))
+				}
+				tokenPricing, tokenPriced := audit.EstimateOfficialCost(pricingModel, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.ContextInputTokens)
+				if successful && imagePriced {
+					record.EstimatedCostInUSDTicks = imagePricing.CostInUSDTicks
+					record.PricingModel = imagePricing.Model
+					record.PricingVersion = audit.OfficialPricingAsOf
+				} else if tokenPriced {
+					record.EstimatedCostInUSDTicks = tokenPricing.CostInUSDTicks
+					record.PricingModel = tokenPricing.Model
+					record.PricingVersion = audit.OfficialPricingAsOf
+				}
+				record.NumSourcesUsed = usage.NumSourcesUsed
+				record.NumServerSideToolsUsed = usage.NumServerSideToolsUsed
+				record.ContextInputTokens = usage.ContextInputTokens
+				record.ContextOutputTokens = usage.ContextOutputTokens
+				if successful && input.Streaming {
+					record.FirstTokenMS = firstToken.milliseconds()
+				}
+				record.DurationMS = time.Since(startedAt).Milliseconds()
+				record.ErrorCode = errorCode
+				attempts := failureAttempts.snapshot()
+				if !successful && len(attempts) == 0 {
+					statusCode := response.StatusCode
+					failureAttempts.append(audit.Attempt{
+						Source:             audit.AttemptSourceUpstreamHTTP,
+						Stage:              "response_stream",
+						AccountID:          auditAccountID(credential.ID),
+						AccountName:        credential.Name,
+						Method:             http.MethodPost,
+						RequestPath:        sanitizeRequestPath(path),
+						UpstreamURL:        sanitizeUpstreamURL(response.UpstreamURL),
+						StartedAt:          upstreamStartedAt.UTC(),
+						DurationMS:         time.Since(upstreamStartedAt).Milliseconds(),
+						UpstreamStatusCode: &statusCode,
+						UpstreamStatus:     response.Status,
+						ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
+						TransportError:     errorCode,
+					})
+					attempts = failureAttempts.snapshot()
+				}
+				if !successful || len(attempts) > 0 {
+					record.Attempts = attempts
+				}
+				record.CreatedAt = now
+				applyAuditEgress(&record, egressTrace, route.Provider)
+				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && successful {
+					err := budget.run("response_ownership", finalizationOwnershipBudget, func(stageCtx context.Context) error {
+						return s.responses.Save(stageCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, ModelRouteID: route.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKey, ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now})
+					})
+					if err != nil {
+						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
+					}
+				}
+				if successful && lease.QuotaMode != "" {
+					if lease.QuotaMode != "weekly" {
+						units := max(1, response.QuotaUnits)
+						var updated bool
+						err := budget.run("quota_decrement", finalizationQuotaBudget, func(stageCtx context.Context) error {
+							var decrementErr error
+							updated, decrementErr = s.accounts.DecrementQuota(stageCtx, accountID, lease.QuotaMode, units)
+							return decrementErr
+						})
+						if err != nil {
+							s.logger.Warn("provider_quota_decrement_failed", "provider", credential.Provider, "account_id", accountID, "mode", lease.QuotaMode, "units", units, "error", err)
+						} else if updated {
+							s.selector.ConsumeQuota(credential.Provider, accountID, lease.QuotaMode, units)
+						}
+					}
+				}
+				if err := budget.run("audit", finalizationAuditBudget, func(stageCtx context.Context) error {
+					return s.audits.Create(stageCtx, record)
+				}); err != nil {
+					s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
+				}
+				if usage.ResponseModel != "" {
+					_ = budget.run("observed_model", finalizationMetadataBudget, func(stageCtx context.Context) error {
+						return s.accounts.ObserveResponseModel(stageCtx, accountID, usage.ResponseModel)
+					})
+				}
+				if successful && lease.QuotaMode != "" {
+					if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow {
+						s.accounts.QueueQuotaRefresh(accountID, lease.QuotaMode)
+					}
+				}
+				outcome := "failed"
+				if successful {
+					outcome = "success"
+				}
+				timing.finish(s.logger, outcome)
+			})
+		}
+		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
+		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
+			failureAttempts.captureStreamFailure(credential, upstreamStartedAt, response, diagnostic)
+		}
+		var markFirstToken func()
+		if firstToken != nil {
+			markFirstToken = firstToken.mark
+		}
+		timingHandedOff = true
+		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}
+	}
+	// fail_open retains at most one successful no-thinking stream. The account
+	// lease is released immediately; the read pump applies upstream backpressure
+	// until this response is either delivered or replaced by a better one.
+	type qualityFallback struct {
+		response          *provider.Response
+		lease             *accountLease
+		credential        accountdomain.Credential
+		usage             Usage
+		upstreamStartedAt time.Time
+	}
+	var fallback *qualityFallback
+	discardFallback := func(recordDegraded bool) {
+		if fallback == nil {
+			return
+		}
+		if recordDegraded {
+			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider)
+			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
+		}
+		_ = fallback.response.Body.Close()
+		fallback = nil
+	}
 attemptLoop:
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
+		if qualityHoldEnabled && qualityAccountAttempts >= holdCfg.MaxAttempts {
+			break
+		}
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
-		if ownership != nil {
+		if input.ForcedAccountID != 0 {
+			if input.ForcedEgressNodeID == 0 {
+				err = &SelectionUnavailableError{Reason: SelectionNoAccounts}
+			} else {
+				lease, err = s.selector.AcquirePinnedForQualityProbe(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, accountScope)
+				// An unbound account can still have reached the observed node through
+				// runtime pool selection. The Provider request below carries the forced
+				// node explicitly; only a conflicting concrete binding is invalid.
+				if err == nil && lease.Credential.EgressNodeID != 0 && lease.Credential.EgressNodeID != input.ForcedEgressNodeID {
+					lease.Release()
+					lease = nil
+					err = &SelectionUnavailableError{Reason: SelectionNoAccounts}
+				}
+			}
+		} else if ownership != nil {
 			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
 		} else if input.ForcedEgressNodeID != 0 {
 			lease, err = s.selector.AcquireForKeyOnEgressNode(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted, accountScope, input.ForcedEgressNodeID)
@@ -1037,7 +1276,7 @@ attemptLoop:
 			// Stored Responses are pinned to one account. Return the cached 429
 			// immediately instead of spinning until the cooldown expires or
 			// replaying the request on the same account.
-			if ownership != nil {
+			if ownership != nil || input.ForcedAccountID != 0 {
 				break attemptLoop
 			}
 			attempt--
@@ -1065,6 +1304,9 @@ attemptLoop:
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
 			continue
 		}
+		if qualityHoldEnabled {
+			qualityAccountAttempts++
+		}
 		response, err := forwardResponse(lease, credential, lease.Billing)
 		if err != nil {
 			lease.Release()
@@ -1082,8 +1324,24 @@ attemptLoop:
 			if !isRetryableTransportFailure(credential.Provider, err) {
 				break
 			}
-			if !neterrorpkg.IsUpstreamStreamIdleTimeout(err) {
+			responseFailure := false
+			if status, retryAfter, classified := upstreamResponseErrorHealthPenalty(err, holdCfg.IdleAccountCooldown); classified {
+				responseFailure = true
+				writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+				markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, status, retryAfter)
+				writeCancel()
+				if markErr != nil {
+					s.logger.Warn("upstream_response_health_write_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+				} else {
+					s.logger.Warn("upstream_response_health_retry", "request_id", input.RequestID, "account_id", credential.ID, "status", status, "minimum_cooldown", retryAfter)
+				}
+			} else {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
+			}
+			// The failed response is safe to retry on another account only when
+			// doing so cannot repeat an upstream-hosted tool side effect.
+			if responseFailure && qualityRequestHasReplayUnsafeHostedTools(input.Body) {
+				break attemptLoop
 			}
 			if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
 				break
@@ -1259,9 +1517,9 @@ attemptLoop:
 			}
 			failureHandled := false
 			if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
-				failureHandled = reconcileErr == nil && exhausted
+				state, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.applyRateLimitReconciliation(ctx, credential, response.StatusCode, retryAfter, state, reconcileErr)
+				failureHandled = true
 			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
 				// The Free subscription signal is account-scoped, but its billing
 				// period is not a reliable reset promise. Probe again after 24 hours.
@@ -1307,8 +1565,13 @@ attemptLoop:
 			if lastFailure.AccountScoped && !failureHandled {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			} else if !lastFailure.AccountScoped && response.StatusCode >= http.StatusInternalServerError {
-				// 5xx 短冷却：本请求已 excluded，跨请求避免立刻再打同一坏号。
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				// Provider-wide 5xx responses should rotate this request and briefly
+				// isolate the account across requests, but must not grow the durable
+				// account failure count exponentially. Preserve the real status in
+				// health diagnostics while applying the explicit soft policy.
+				if markErr := s.selector.markSoftFailure(ctx, credential, response.StatusCode, retryAfter); markErr != nil {
+					s.logger.Warn("upstream_soft_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "error", markErr)
+				}
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
@@ -1320,6 +1583,93 @@ attemptLoop:
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
+			if qualityHoldEnabled {
+				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				if peekErr != nil {
+					if replay != nil {
+						_ = replay.Close()
+					} else {
+						_ = response.Body.Close()
+					}
+					lease.Release()
+					lastErr = peekErr
+					if isClientRequestCancel(ctx, peekErr) {
+						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
+						break
+					}
+					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
+					if neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx)) || errors.Is(peekErr, errQualityEmptyStream) {
+						logPrefix := "quality_peek_idle"
+						if errors.Is(peekErr, errQualityEmptyStream) {
+							logPrefix = "quality_peek_empty"
+						}
+						writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+						if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, http.StatusGatewayTimeout, holdCfg.IdleAccountCooldown); markErr != nil {
+							s.logger.Warn(logPrefix+"_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+						} else {
+							s.logger.Warn(logPrefix+"_retry", "request_id", input.RequestID, "account_id", credential.ID, "cooldown", holdCfg.IdleAccountCooldown)
+						}
+						writeCancel()
+					}
+					if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+						break
+					}
+					continue
+				}
+				response.Body = replay
+				hasNextAccount := attemptPolicy.hasNext(attempt) && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
+				hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
+				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+				if verdict == QualityWithhold {
+					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+				}
+				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
+				if commit.Audit && !deferFailOpenAudit {
+					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
+					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
+				}
+				switch commit.Action {
+				case QualityActionRetry:
+					if deferFailOpenAudit {
+						discardFallback(true)
+						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, upstreamStartedAt: responseStartedAt}
+						lease.completeSelectorObservation(true)
+						lease.Release()
+					} else {
+						_ = response.Body.Close()
+						lease.Release()
+					}
+					lastErr = errQualityDegraded
+					lastFailure = &UpstreamFailure{
+						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
+						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
+						Cause: errQualityDegraded,
+					}
+					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					continue
+				case QualityActionReject:
+					_ = response.Body.Close()
+					lease.Release()
+					lastErr = errQualityDegraded
+					lastFailure = &UpstreamFailure{
+						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
+						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
+						Cause: errQualityDegraded,
+					}
+					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+					break attemptLoop
+				case QualityActionDeliverLast:
+					discardFallback(true)
+					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+				case QualityActionDeliver:
+					discardFallback(true)
+				}
+				if !commit.KeepBody {
+					_ = response.Body.Close()
+					lease.Release()
+					break attemptLoop
+				}
+			}
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
 				if recoveredFailure.AccountBlocked || (credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(recoveredFailure)) {
@@ -1330,119 +1680,25 @@ attemptLoop:
 				}
 			}
 		}
-		accountID := credential.ID
-		var once sync.Once
-		finalize := func(usage Usage, responseID, errorCode string) {
-			once.Do(func() {
-				// HTTP 状态码保留线上真实值；流在 2xx 响应头之后失败时由 errorCode
-				// 决定最终结果，避免把协议状态与业务结果混为一谈。
-				successful := auditRequestSucceeded(response.StatusCode, errorCode)
-				lease.completeSelectorObservation(successful)
-				budget := newFinalizationBudget(string(operation), string(route.Provider))
-				if isUpstreamStreamFailure(errorCode) {
-					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
-						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, http.StatusBadGateway, 0)
-					}); err != nil {
-						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
-					}
-				}
-				lease.Release()
-				now := time.Now().UTC()
-				record := auditBase
-				record.AccountID = &accountID
-				record.AccountName = credential.Name
-				record.StatusCode = response.StatusCode
-				record.InputTokens = usage.InputTokens
-				record.CachedInputTokens = usage.CachedInputTokens
-				record.OutputTokens = usage.OutputTokens
-				record.ReasoningTokens = usage.ReasoningTokens
-				record.TotalTokens = usage.TotalTokens
-				record.CostInUSDTicks = usage.CostInUSDTicks
-				imagePricing, imagePriced := audit.EstimateOfficialImageCost(pricingModel, "", "", response.QuotaUnits)
-				if imagePriced {
-					record.MediaOutputImages = int64(max(0, response.QuotaUnits))
-				}
-				tokenPricing, tokenPriced := audit.EstimateOfficialCost(pricingModel, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, usage.ContextInputTokens)
-				if successful && imagePriced {
-					record.EstimatedCostInUSDTicks = imagePricing.CostInUSDTicks
-					record.PricingModel = imagePricing.Model
-					record.PricingVersion = audit.OfficialPricingAsOf
-				} else if tokenPriced {
-					record.EstimatedCostInUSDTicks = tokenPricing.CostInUSDTicks
-					record.PricingModel = tokenPricing.Model
-					record.PricingVersion = audit.OfficialPricingAsOf
-				}
-				record.NumSourcesUsed = usage.NumSourcesUsed
-				record.NumServerSideToolsUsed = usage.NumServerSideToolsUsed
-				record.ContextInputTokens = usage.ContextInputTokens
-				record.ContextOutputTokens = usage.ContextOutputTokens
-				if successful && input.Streaming {
-					record.FirstTokenMS = firstToken.milliseconds()
-				}
-				record.DurationMS = time.Since(startedAt).Milliseconds()
-				record.ErrorCode = errorCode
-				attempts := failureAttempts.snapshot()
-				if !successful || len(attempts) > 0 {
-					record.Attempts = attempts
-				}
-				record.CreatedAt = now
-				applyAuditEgress(&record, egressTrace, route.Provider)
-				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && successful {
-					err := budget.run("response_ownership", finalizationOwnershipBudget, func(stageCtx context.Context) error {
-						return s.responses.Save(stageCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, ModelRouteID: route.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKey, ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now})
-					})
-					if err != nil {
-						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
-					}
-				}
-				if successful && lease.QuotaMode != "" {
-					if lease.QuotaMode != "weekly" {
-						units := max(1, response.QuotaUnits)
-						var updated bool
-						err := budget.run("quota_decrement", finalizationQuotaBudget, func(stageCtx context.Context) error {
-							var decrementErr error
-							updated, decrementErr = s.accounts.DecrementQuota(stageCtx, accountID, lease.QuotaMode, units)
-							return decrementErr
-						})
-						if err != nil {
-							s.logger.Warn("provider_quota_decrement_failed", "provider", credential.Provider, "account_id", accountID, "mode", lease.QuotaMode, "units", units, "error", err)
-						} else if updated {
-							s.selector.ConsumeQuota(credential.Provider, accountID, lease.QuotaMode, units)
-						}
-					}
-				}
-				if err := budget.run("audit", finalizationAuditBudget, func(stageCtx context.Context) error {
-					return s.audits.Create(stageCtx, record)
-				}); err != nil {
-					s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
-				}
-				if usage.ResponseModel != "" {
-					_ = budget.run("observed_model", finalizationMetadataBudget, func(stageCtx context.Context) error {
-						return s.accounts.ObserveResponseModel(stageCtx, accountID, usage.ResponseModel)
-					})
-				}
-				if successful && lease.QuotaMode != "" {
-					if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow {
-						s.accounts.QueueQuotaRefresh(accountID, lease.QuotaMode)
-					}
-				}
-				outcome := "failed"
-				if successful {
-					outcome = "success"
-				}
-				timing.finish(s.logger, outcome)
-			})
+		if fallback != nil && holdCfg.OnExhausted == qualityRetryFailOpen {
+			_ = response.Body.Close()
+			lease.completeSelectorObservation(false)
+			lease.Release()
+			selected := fallback
+			fallback = nil
+			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
 		}
-		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
-		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
-			failureAttempts.captureStreamFailure(credential, responseStartedAt, response, diagnostic)
+		return handoffResponse(response, lease, credential, responseStartedAt), nil
+	}
+	if fallback != nil {
+		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
+			selected := fallback
+			fallback = nil
+			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
+			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
 		}
-		var markFirstToken func()
-		if firstToken != nil {
-			markFirstToken = firstToken.mark
-		}
-		timingHandedOff = true
-		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
+		discardFallback(true)
 	}
 	if lastFailure != nil {
 		record := auditBase
@@ -1489,10 +1745,44 @@ attemptLoop:
 
 func isUpstreamStreamFailure(errorCode string) bool {
 	switch errorCode {
-	case "upstream_stream_incomplete", "upstream_stream_interrupted":
+	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_idle_timeout", "upstream_response_empty":
 		return true
 	default:
 		return false
+	}
+}
+
+func streamFailureHealthPenalty(errorCode string, usage Usage, idleCooldown time.Duration) (int, time.Duration) {
+	if (errorCode == "upstream_stream_idle_timeout" || errorCode == "upstream_response_empty") && !usage.OutputObserved && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 {
+		if idleCooldown <= 0 {
+			idleCooldown = qualityIdleAccountCooldown
+		}
+		if errorCode == "upstream_response_empty" {
+			return http.StatusBadGateway, idleCooldown
+		}
+		return http.StatusGatewayTimeout, idleCooldown
+	}
+	return 0, 0
+}
+
+// upstreamResponseErrorHealthPenalty classifies failures that happen after a
+// successful response header but before a usable non-streaming body exists.
+// A truly empty response receives the configured long cooldown. If some body
+// bytes arrived before an idle timeout, retain only the ordinary short network
+// cooldown by returning a zero status/retry pair.
+func upstreamResponseErrorHealthPenalty(err error, idleCooldown time.Duration) (int, time.Duration, bool) {
+	switch {
+	case neterrorpkg.IsUpstreamResponseEmpty(err):
+		status, cooldown := streamFailureHealthPenalty("upstream_response_empty", Usage{}, idleCooldown)
+		return status, cooldown, true
+	case neterrorpkg.IsUpstreamStreamIdleTimeout(err):
+		if neterrorpkg.IdleTimeoutObservedData(err) {
+			return 0, 0, true
+		}
+		status, cooldown := streamFailureHealthPenalty("upstream_stream_idle_timeout", Usage{}, idleCooldown)
+		return status, cooldown, true
+	default:
+		return 0, 0, false
 	}
 }
 
@@ -1792,7 +2082,7 @@ func shouldStopForNonAccountFingerprint(fingerprints map[string]int, failure *Up
 	}
 	fingerprints[failure.Fingerprint]++
 	limit := nonAccountFailureFingerprintLimit
-	if failure.Code == "upstream_stream_idle_timeout" || failure.Fingerprint == "upstream_stream_idle_timeout" {
+	if failure.Code == "upstream_stream_idle_timeout" || failure.Fingerprint == "upstream_stream_idle_timeout" || failure.Code == "upstream_stream_empty" || failure.Fingerprint == "upstream_stream_empty" {
 		limit = streamIdleFailureFingerprintLimit
 	}
 	return fingerprints[failure.Fingerprint] >= limit
@@ -1836,6 +2126,23 @@ func isTerminalRequestForbidden(upstreamProvider accountdomain.Provider, failure
 func forcesAccountFailover(status int, upstreamProvider accountdomain.Provider) bool {
 	return upstreamProvider == accountdomain.ProviderBuild &&
 		(status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusTooManyRequests)
+}
+
+func (s *Service) applyRateLimitReconciliation(ctx context.Context, credential accountdomain.Credential, status int, retryAfter time.Duration, state accountapp.RateLimitReconcileState, reconcileErr error) {
+	s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+	if reconcileErr == nil && state == accountapp.RateLimitReconcileExhausted {
+		return
+	}
+	if credential.Provider == accountdomain.ProviderConsole && status == http.StatusTooManyRequests {
+		// A Console 429 with available quota, an in-progress cross-instance probe,
+		// or an inconclusive /usage request is transient. Isolate the account for
+		// this Retry-After window without growing its durable failure count.
+		if err := s.selector.markSoftFailure(ctx, credential, status, retryAfter); err != nil {
+			s.logger.Warn("console_rate_limit_soft_cooldown_failed", "account_id", credential.ID, "state", state, "error", err)
+		}
+		return
+	}
+	s.selector.MarkFailure(ctx, credential, status, retryAfter)
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

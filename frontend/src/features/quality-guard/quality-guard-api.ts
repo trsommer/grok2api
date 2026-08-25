@@ -1,5 +1,6 @@
 import { apiRequest } from "@/shared/api/client";
 import { createObjectDecoder, hasShape, isArrayOf, isBoolean, isNumber, isObject, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
+import { qualityGuardStatusPath } from "./quality-guard-query";
 
 export type QualityGuardPolicy = {
   mode: "active" | "passive" | "hybrid";
@@ -14,6 +15,9 @@ export type QualityGuardPolicy = {
 };
 
 export type QualityGuardNodeState = {
+  observe_only?: boolean;
+  observe_only_reason?: string;
+  quarantined_lease_count?: number;
   active_soft_strikes: number;
   passive_soft_strikes: number;
   error_strikes: number;
@@ -35,9 +39,12 @@ export type QualityGuardEvent = {
   event: string;
   node_id: string;
   node_name: string;
+  account_id?: string;
+  request_id?: string;
   reason: string;
   classification: string;
   output_tps: number;
+  cooldown_until?: number;
 };
 
 export type QualityGuardDetectionStats = {
@@ -102,6 +109,7 @@ export type QualityGuardStatus = {
     min_generation_ms: number;
   };
   nodes?: Record<string, QualityGuardNodeState>;
+  nodeSummary?: { total: number; quarantined: number; quarantinedLeases: number };
   protectedNodeIds?: string[];
   recentEvents?: QualityGuardEvent[];
   statistics?: QualityGuardStatistics;
@@ -122,6 +130,7 @@ export type QualityTestResult = {
 };
 
 const nodeStateValidator = hasShape({
+  observe_only: isOptional(isBoolean), observe_only_reason: isOptional(isString), quarantined_lease_count: isOptional(isNumber),
   active_soft_strikes: isNumber, passive_soft_strikes: isNumber, error_strikes: isNumber,
   quarantined_until: isNumber, disabled_by_guard: isBoolean, last_reason: isString,
   last_probe_at: isNumber, last_observed_at: isNumber, last_source: isString,
@@ -130,7 +139,9 @@ const nodeStateValidator = hasShape({
 });
 const eventValidator = hasShape({
   ts: isNumber, event: isString, node_id: isString, node_name: isString,
+  account_id: isOptional(isString), request_id: isOptional(isString),
   reason: isString, classification: isString, output_tps: isNumber,
+  cooldown_until: isOptional(isNumber),
 });
 const configValidator = hasShape({
   mode: isOneOf("active", "passive", "hybrid"), model: isString,
@@ -149,6 +160,9 @@ const statisticsValidator = hasShape({
   passive: detectionStatsValidator,
   actions: hasShape({ quarantined: isNumber, restored: isNumber, suppressed: isNumber }),
 });
+const nodeSummaryValidator = hasShape({
+  total: isNumber, quarantined: isNumber, quarantinedLeases: isNumber,
+});
 
 const decodeStatus = (value: unknown): QualityGuardStatus => {
   if (hasShape({ available: isBoolean })(value) && (value as QualityGuardStatus).available === false) {
@@ -161,7 +175,7 @@ const decodeStatus = (value: unknown): QualityGuardStatus => {
       id: isString, name: isString, built_in: isBoolean, match_mode: isString, has_expected: isBoolean,
       require_thinking: isBoolean,
     }))),
-    config: configValidator, nodes: isRecordOf(nodeStateValidator),
+    config: configValidator, nodes: isRecordOf(nodeStateValidator), nodeSummary: isOptional(nodeSummaryValidator),
     protectedNodeIds: isOptional(isArrayOf(isString)),
     recentEvents: isArrayOf(eventValidator), statistics: isOptional(statisticsValidator),
   })(value);
@@ -174,8 +188,8 @@ const decodeQualityTest = createObjectDecoder<QualityTestResult>("quality test",
   thinkingRequired: isBoolean,
 });
 
-export function getQualityGuardStatus(): Promise<QualityGuardStatus> {
-  return apiRequest("/api/admin/v1/egress-quality-guard", {}, decodeStatus);
+export function getQualityGuardStatus(nodeIds?: string[]): Promise<QualityGuardStatus> {
+  return apiRequest(qualityGuardStatusPath(nodeIds), {}, decodeStatus);
 }
 
 export function runQualityTest(nodeId: string, status: QualityGuardStatus, profileId?: string): Promise<QualityTestResult> {
@@ -220,7 +234,7 @@ export function updateQualityGuardPolicy(policy: QualityGuardPolicy): Promise<{ 
 }
 
 export type DegradeWindow = "1h" | "6h" | "24h" | "7d";
-export type DegradeClass = "buffered_burst" | "soft_tps" | "hard_tps";
+export type DegradeClass = "buffered_burst" | "soft_tps" | "hard_tps" | "missing_thinking";
 
 export type DegradeAccountDTO = {
   id: string;
@@ -234,6 +248,7 @@ export type DegradeAccountDTO = {
   enabled: boolean;
   found: boolean;
   bfs: number;
+  leaseQuarantinedUntil?: string;
 };
 
 export type DegradeEventDTO = {
@@ -253,7 +268,7 @@ export type DegradeSummaryDTO = {
   window: DegradeWindow;
   generatedAt: string;
   thresholds: { softTPS: number; hardTPS: number; minGenMs: number; minOutputTokens: number };
-  totals: { hits: number; accounts: number; stillEnabled: number; disabled: number; deleted: number; hard: number; soft: number; burst: number; maxTPS: number };
+  totals: { hits: number; accounts: number; stillEnabled: number; disabled: number; deleted: number; hard: number; soft: number; burst: number; thinking: number; maxTPS: number };
   series: { label: string; count: number; severe: number }[];
   nodes: { name: string; hits: number; accounts: number; maxTPS: number }[];
   accounts: DegradeAccountDTO[];
@@ -261,18 +276,19 @@ export type DegradeSummaryDTO = {
   events: DegradeEventDTO[];
 };
 
-const degradeClassValidator = isOneOf("buffered_burst", "soft_tps", "hard_tps");
+const degradeClassValidator = isOneOf("buffered_burst", "soft_tps", "hard_tps", "missing_thinking");
 
 const decodeDegradeSummary = createObjectDecoder<DegradeSummaryDTO>("degrade accounts", {
   window: isOneOf("1h", "6h", "24h", "7d"),
   generatedAt: isString,
   thresholds: hasShape({ softTPS: isNumber, hardTPS: isNumber, minGenMs: isNumber, minOutputTokens: isNumber }),
-  totals: hasShape({ hits: isNumber, accounts: isNumber, stillEnabled: isNumber, disabled: isNumber, deleted: isNumber, hard: isNumber, soft: isNumber, burst: isNumber, maxTPS: isNumber }),
+  totals: hasShape({ hits: isNumber, accounts: isNumber, stillEnabled: isNumber, disabled: isNumber, deleted: isNumber, hard: isNumber, soft: isNumber, burst: isNumber, thinking: isNumber, maxTPS: isNumber }),
   series: isArrayOf(hasShape({ label: isString, count: isNumber, severe: isNumber })),
   nodes: isArrayOf(hasShape({ name: isString, hits: isNumber, accounts: isNumber, maxTPS: isNumber })),
   accounts: isArrayOf(hasShape({
     id: isString, name: isString, email: isString, hits: isNumber, maxTPS: isNumber,
     classes: isObject, nodes: isArrayOf(isString), last: isString, enabled: isBoolean, found: isBoolean, bfs: isNumber,
+    leaseQuarantinedUntil: isOptional(isString),
   })),
   accountPage: hasShape({ page: isNumber, pageSize: isNumber, total: isNumber, hasMore: isBoolean }),
   events: isArrayOf(hasShape({

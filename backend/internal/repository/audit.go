@@ -17,6 +17,7 @@ type AuditRepository interface {
 	Summarize(ctx context.Context, query AuditSummaryQuery) (audit.Summary, error)
 	SumTokensByAccountsSince(ctx context.Context, accountIDs []uint64, since time.Time) (map[uint64]int64, error)
 	SummarizeDegrade(ctx context.Context, query DegradeSummaryQuery) (DegradeSummaryResult, error)
+	PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 type DegradeSummaryQuery struct {
@@ -61,6 +62,7 @@ type DegradeTotals struct {
 	Hard         int64
 	Soft         int64
 	Burst        int64
+	Thinking     int64
 	MaxTPS       float64
 }
 
@@ -73,10 +75,12 @@ type DegradeAccount struct {
 	Burst              int64
 	Soft               int64
 	Hard               int64
+	Thinking           int64
 	Last               time.Time
 	Enabled            bool
 	Found              bool
 	BuildBotFlagSource int
+	LeaseCooldownUntil *time.Time
 	Nodes              []string
 }
 

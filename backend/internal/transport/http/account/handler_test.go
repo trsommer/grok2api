@@ -3,10 +3,15 @@ package account
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,10 +19,54 @@ import (
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
+	gatewayapp "github.com/chenyme/grok2api/backend/internal/application/gateway"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	cliprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/cli"
+	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
+	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 	"github.com/gin-gonic/gin"
 )
+
+type refreshTokenImportHTTPAdapter struct {
+	parser provider.CredentialCodecAdapter
+}
+
+func (refreshTokenImportHTTPAdapter) Provider() accountdomain.Provider {
+	return accountdomain.ProviderBuild
+}
+
+func (refreshTokenImportHTTPAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider:       accountdomain.ProviderBuild,
+		ModelNamespace: accountdomain.ProviderBuild.ModelNamespace(),
+		Credential: provider.CredentialSurface{
+			AuthType: accountdomain.AuthTypeOAuth,
+			Import:   true,
+			Refresh:  true,
+		},
+	}
+}
+
+func (a refreshTokenImportHTTPAdapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
+	return a.parser.ParseImportedCredentials(data)
+}
+
+func (refreshTokenImportHTTPAdapter) MarshalCredentials([]provider.CredentialSeed) ([]byte, error) {
+	return nil, nil
+}
+
+func (refreshTokenImportHTTPAdapter) PrepareImportedCredential(_ context.Context, seed provider.CredentialSeed) (provider.CredentialSeed, error) {
+	if seed.RefreshToken == "invalid-rt" {
+		return provider.CredentialSeed{}, errors.New("invalid_grant")
+	}
+	seed.AccessToken = "fresh-access"
+	seed.RefreshToken = "rotated-rt"
+	seed.ExpiresAt = time.Now().UTC().Add(time.Hour)
+	return seed, nil
+}
 
 func TestNewAccountResponseExposesBuildBotFlagOnlyForBuild(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
@@ -179,6 +228,139 @@ func TestLinkedDeleteMissingAccountReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestClearCooldownResetsHealthAndSelectorCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "clear-cooldown.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAccountRepository(database)
+	selector := gatewayapp.NewSelector(repo, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	repo.SetInvalidationObserver(func(_ context.Context, event repository.InvalidationEvent) {
+		selector.ApplyInvalidation(event)
+	})
+	until := time.Now().UTC().Add(24 * time.Hour)
+	created, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "cooled", SourceKey: "cooled",
+		EncryptedAccessToken: "token", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveBilling(ctx, accountdomain.Billing{
+		AccountID: created.ID, PlanCode: "pro", PlanName: "Pro", MonthlyLimit: 100, Used: 25, SyncedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateHealth(ctx, created.ID, created.Provider, 3, &until, accountdomain.LastErrorMissingThinking, false); err != nil {
+		t.Fatal(err)
+	}
+	if lease, acquireErr := selector.Acquire(ctx, accountdomain.ProviderBuild, 0, "grok-test", "", "", map[uint64]bool{}, false); acquireErr == nil {
+		lease.Release()
+		t.Fatal("cooled account was schedulable before clear")
+	}
+	service := accountapp.NewService(repo, relational.NewAuditRepository(database), nil, nil, nil, nil, nil)
+	handler := NewHandler(service, nil)
+
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Params = []gin.Param{{Key: "id", Value: strconv.FormatUint(created.ID, 10)}}
+	ginContext.Request = httptest.NewRequest("POST", "/api/admin/v1/accounts/"+strconv.FormatUint(created.ID, 10)+"/clear-cooldown", nil)
+	handler.clearCooldown(ginContext)
+	if recorder.Code != 200 {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"cooldownUntil"`) || strings.Contains(recorder.Body.String(), `"failureCount":3`) {
+		t.Fatalf("cooldown still present: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"failureCount":0`) {
+		t.Fatalf("failureCount not reset: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"lastError":"missing_thinking"`) {
+		t.Fatalf("missing-thinking strike was cleared: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"planCode":"pro"`) || !strings.Contains(recorder.Body.String(), `"billing"`) {
+		t.Fatalf("complete account view was not returned: %s", recorder.Body.String())
+	}
+
+	stored, err := repo.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.FailureCount != 0 || stored.CooldownUntil != nil || stored.LastError != accountdomain.LastErrorMissingThinking {
+		t.Fatalf("persisted health = failure=%d cooldown=%v last=%q", stored.FailureCount, stored.CooldownUntil, stored.LastError)
+	}
+	lease, err := selector.Acquire(ctx, accountdomain.ProviderBuild, 0, "grok-test", "", "", map[uint64]bool{}, false)
+	if err != nil {
+		t.Fatalf("account remained unavailable in selector after clear: %v", err)
+	}
+	if lease.Credential.ID != created.ID || lease.Credential.LastError != accountdomain.LastErrorMissingThinking {
+		t.Fatalf("lease credential = %#v", lease.Credential)
+	}
+	lease.Release()
+
+	missing := httptest.NewRecorder()
+	missingCtx, _ := gin.CreateTestContext(missing)
+	missingCtx.Params = []gin.Param{{Key: "id", Value: "999999"}}
+	missingCtx.Request = httptest.NewRequest("POST", "/api/admin/v1/accounts/999999/clear-cooldown", nil)
+	handler.clearCooldown(missingCtx)
+	if missing.Code != 404 {
+		t.Fatalf("missing status = %d, body = %s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestUpdateCooldownWarningRequiresEnabledChange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "update-cooldown-warning.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAccountRepository(database)
+	created, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "cooled", SourceKey: "cooled-warning",
+		EncryptedAccessToken: "token", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().UTC().Add(time.Hour)
+	if err := repo.UpdateHealth(ctx, created.ID, created.Provider, 1, &until, "upstream status 504", false); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(accountapp.NewService(repo, relational.NewAuditRepository(database), nil, nil, nil, nil, nil), nil)
+
+	update := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginContext, _ := gin.CreateTestContext(recorder)
+		ginContext.Params = []gin.Param{{Key: "id", Value: strconv.FormatUint(created.ID, 10)}}
+		ginContext.Request = httptest.NewRequest("PATCH", "/api/admin/v1/accounts/"+strconv.FormatUint(created.ID, 10), strings.NewReader(body))
+		ginContext.Request.Header.Set("Content-Type", "application/json")
+		handler.update(ginContext)
+		return recorder
+	}
+
+	same := update(`{"enabled":true}`)
+	if same.Code != http.StatusOK || strings.Contains(same.Body.String(), `"enabledDoesNotClearCooldown":true`) {
+		t.Fatalf("unchanged enabled warning: status=%d body=%s", same.Code, same.Body.String())
+	}
+	changed := update(`{"enabled":false}`)
+	if changed.Code != http.StatusOK || !strings.Contains(changed.Body.String(), `"enabledDoesNotClearCooldown":true`) {
+		t.Fatalf("changed enabled warning missing: status=%d body=%s", changed.Code, changed.Body.String())
+	}
+}
+
 func (s *accountSynchronizerStub) Sync(_ context.Context, accountIDs ...uint64) accountsyncapp.Result {
 	s.accountIDs = append(s.accountIDs, accountIDs...)
 	return accountsyncapp.Result{Succeeded: len(accountIDs)}
@@ -283,6 +465,80 @@ func TestReadAccountImportDocumentsAcceptsMultipleFiles(t *testing.T) {
 	documents, ok := readAccountImportDocuments(ctx, "账号凭据 JSON")
 	if !ok || len(documents) != 2 {
 		t.Fatalf("documents = %q, status = %d", documents, recorder.Code)
+	}
+}
+
+func TestRefreshTokenImportHTTPReturnsPartialResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "rt-import-http.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewAccountRepository(database)
+	adapter := refreshTokenImportHTTPAdapter{parser: cliprovider.NewAdapter(cliprovider.Config{}, cipher)}
+	service := accountapp.NewService(repository, nil, nil, nil, provider.NewRegistry(adapter), cipher, nil)
+	handler := NewHandler(service, nil)
+	router := gin.New()
+	handler.Register(router.Group("/api/admin/v1"))
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("files", "refresh-tokens.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("rt=valid-rt\nrt=valid-rt\nrt=invalid-rt\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/admin/v1/accounts/import", &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set("Accept", "text/event-stream")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	responseData, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody := string(responseData)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, responseBody)
+	}
+	if !strings.Contains(responseBody, "event: complete\n") || !strings.Contains(responseBody, `{"created":1,"updated":0,"skipped":1,"failed":1,"synced":0,"syncFailed":0}`) {
+		t.Fatalf("body = %s", responseBody)
+	}
+	stored, err := repository.ListEnabled(ctx, accountdomain.ProviderBuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored accounts = %#v", stored)
+	}
+	refreshToken, err := cipher.Decrypt(stored[0].EncryptedRefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshToken != "rotated-rt" {
+		t.Fatalf("stored refresh token = %q", refreshToken)
 	}
 }
 

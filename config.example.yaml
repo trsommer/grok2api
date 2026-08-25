@@ -8,6 +8,10 @@ server:
   listen: "127.0.0.1:8000"
   # [通常不要修改] 单次请求体上限 32 MiB。
   maxBodyBytes: 33554432
+  # [按需修改] 仅列出会覆盖 X-Forwarded-For / X-Real-IP 的可信反向代理。
+  # 留空时忽略所有转发头并记录直连对端 IP；不要使用 0.0.0.0/0 或 ::/0。
+  # Docker/Nginx 示例：["127.0.0.1", "172.16.0.0/12"]
+  trustedProxies: []
   # [通常不要修改] 仅限制客户端上传完整请求体的时间，不限制推理或流式响应。
   readTimeout: 15m
   # [通常不要修改] 管理 API 和非流式请求的最长生命周期。
@@ -95,6 +99,14 @@ routing:
   segmentedSelectorEnabled: true
   segmentedSelectorMinCandidates: 3000
   segmentedSelectorWindowSize: 64
+  # [按需修改] 大账号池才需要打开。0 保持历史行为：不健康节点上的 auto 账号会一次性迁走。
+  # 0.05–1 表示每个健康节点最多吸收该比例的活跃账号。环境变量
+  # GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE 可覆盖。
+  autoAssignMaxNodeShare: 0
+  # [按需修改] 大账号池才需要打开。0 保持历史行为：首轮疏散不限额，容量/再均衡仍最多 200 次。
+  # 0.05–1 限制单轮已绑定账号迁移比例。环境变量
+  # GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE 可覆盖。
+  autoAssignMaxMigrationShare: 0
 
 audit:
   # [通常不要修改] 审计批量写入参数；bufferSize 的修改需重启生效。
@@ -103,6 +115,8 @@ audit:
   flushInterval: 250ms
   # [通常不要修改] 需要调用方确认提交的审计最多聚合等待该时长；建议保持 1ms–50ms。
   commitDelay: 5ms
+  # [按需修改] 自动清理超过该天数的请求审计与尝试诊断；0 表示永久保留。
+  retentionDays: 7
   # [通常不要修改] enforce 会在异常持续超过宽限期后暂停新的推理请求；确认发生数据丢失时会立即暂停。
   ledgerMode: enforce # observe | enforce
   ledgerFailureThreshold: 1
@@ -115,7 +129,7 @@ qualityGuard:
   enabled: false
   # 主程序会自动创建并复用不可导出的内部探测身份，无需配置 Client Key。
   # 使用已验证会输出推理 Token 的 Build 模型时，内置恢复探针还会校验 reasoning Token。
-  model: "grok-4.5"
+  model: "grok-4.6"
   mode: hybrid # passive | active | hybrid
   activeInterval: 30m
   passivePollInterval: 5s
@@ -135,3 +149,25 @@ qualityGuard:
   rotationTimeout: 45s
   nodeIDs: []
   rotatableNodeIDs: []
+  # Optional request-path withhold/retry for thinking models.
+  # Observe up to 30s for real reasoning evidence. If upstream has announced
+  # a reasoning item and visible output but proof arrives later, the still-open
+  # stream is released at the deadline without penalizing the account. Empty or
+  # terminal no-thinking responses are still retried.
+  # Missing thinking with enough visible output is not delivered; another
+  # account is tried (up to maxAttempts). fail_closed returns 503 instead
+  # of the last body. Sidecar qualityGuard.enabled stays false until you
+  # start the quality-guard profile.
+  requestRetry:
+    enabled: true
+    maxAttempts: 6
+    holdTimeout: 30s
+    minOutputTokens: 8
+    onExhausted: fail_closed # fail_open | fail_closed
+    # First missing-thinking hit cools the account; a later hit after the
+    # cooldown expires disables it.
+    accountCooldown: 12h
+    # Empty SSE / idle-timeout penalty. Independent of accountCooldown.
+    # Single-account pools should set this lower; toggling enabled does not
+    # clear cooldown — use POST /api/admin/v1/accounts/:id/clear-cooldown.
+    idleAccountCooldown: 15m

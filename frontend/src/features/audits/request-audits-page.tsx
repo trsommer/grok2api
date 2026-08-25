@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, CornerDownRight, Database, Info, Minimize2, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, CornerDownRight, Database, Globe2, Info, Minimize2, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
 import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -12,6 +12,7 @@ import { listModels } from "@/entities/model/model-api";
 import { listClientKeys } from "@/features/client-keys/client-keys-api";
 import { listAccounts } from "@/features/accounts/accounts-api";
 import { RequestAuditDetailDialog } from "@/features/audits/request-audit-detail-dialog";
+import { buildAuditUsageView } from "@/features/audits/audit-usage";
 import { getRequestAudits, getRequestAuditSummary, type AuditBillingBreakdownDTO, type AuditBillingComponentDTO, type AuditDTO, type AuditPeriod } from "@/features/audits/request-audits-api";
 import { EmptyState, ErrorState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
@@ -277,9 +278,8 @@ export function RequestAuditsPage() {
         {auditsQuery.isError ? <ErrorState message={auditsQuery.error.message} onRetry={() => void auditsQuery.refetch()} /> : null}
         {result && result.items.length === 0 ? <EmptyState /> : null}
         {auditsQuery.isPending || (result && result.items.length > 0) ? (
-          <Table viewportRows={20} rowHeight={72} aria-busy={auditsQuery.isFetching} className={cn("min-w-[1184px] table-fixed text-xs transition-opacity", auditsQuery.isPlaceholderData && "pointer-events-none opacity-60")}>
+          <Table viewportRows={20} rowHeight={96} aria-busy={auditsQuery.isFetching} className={cn("min-w-[1008px] table-fixed text-xs transition-opacity", auditsQuery.isPlaceholderData && "pointer-events-none opacity-60")}>
             <colgroup>
-              <col className="w-44" />
               <col className="w-36" />
               <col className="w-24" />
               <col className="w-24" />
@@ -290,7 +290,6 @@ export function RequestAuditsPage() {
             </colgroup>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
-                <SortableTableHead field="request" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.request")}</SortableTableHead>
                 <SortableTableHead field="model" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.model")}</SortableTableHead>
                 <TableHead className="text-center">{t("audits.egress")}</TableHead>
                 <SortableTableHead field="billing" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.billing")}</SortableTableHead>
@@ -301,9 +300,9 @@ export function RequestAuditsPage() {
               </TableRow>
             </TableHeader>
             {auditsQuery.isPending ? (
-              <TableBody><TableLoadingRow colSpan={8} /></TableBody>
+              <TableBody><TableLoadingRow colSpan={7} /></TableBody>
             ) : (
-              <VirtualTableBody items={result?.items ?? []} colSpan={8} rowHeight={72} overscan={6} renderRow={renderAuditRow} />
+              <VirtualTableBody items={result?.items ?? []} colSpan={7} rowHeight={96} overscan={6} renderRow={renderAuditRow} />
             )}
           </Table>
         ) : null}
@@ -317,14 +316,18 @@ const AuditRow = memo(function AuditRow({ audit, locale, onOpen }: { audit: Audi
   const createdAt = formatCompactDateTime(audit.createdAt, locale);
   const createdAtLabel = formatDateTime(audit.createdAt, locale);
   return (
-    <TableRow className="h-[72px]">
-      <TableCell><RequestValue audit={audit} /></TableCell>
+    <TableRow className="h-[96px]">
       <TableCell>
         <ModelRouteValue
           model={audit.modelPublicId || `#${audit.modelRouteId}`}
           upstreamModel={audit.modelUpstreamModel || "-"}
           account={audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-")}
           clientKey={audit.clientKeyName || `#${audit.clientKeyId}`}
+          clientIp={audit.clientIp}
+          requestId={audit.requestId}
+          provider={audit.provider}
+          operation={audit.operation}
+          sources={audit.numSourcesUsed}
         />
       </TableCell>
       <TableCell className="text-center"><EgressValue audit={audit} /></TableCell>
@@ -366,16 +369,6 @@ function splitDuration(value: string): { value: string; unit: string } {
     return { value, unit: "" };
   }
   return { value: value.slice(0, separator), unit: value.slice(separator + 1) };
-}
-
-function RequestValue({ audit }: { audit: AuditDTO }) {
-  const { t } = useTranslation();
-  return (
-    <div className="min-w-0">
-      <span className="block truncate text-xs font-medium">{providerLabel(audit.provider)} · {t(`audits.operations.${audit.operation}`)}</span>
-      <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground" title={audit.requestId}>{audit.requestId}</span>
-    </div>
-  );
 }
 
 function EgressValue({ audit }: { audit: AuditDTO }) {
@@ -537,7 +530,17 @@ function AuditTokenMetric({ icon: Icon, label, value, loading }: { icon: LucideI
   );
 }
 
-function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: string; upstreamModel: string; account: string; clientKey: string }) {
+function ModelRouteValue({ model, upstreamModel, account, clientKey, clientIp, requestId, provider, operation, sources }: {
+  model: string;
+  upstreamModel: string;
+  account: string;
+  clientKey: string;
+  clientIp?: string;
+  requestId: string;
+  provider: AuditDTO["provider"];
+  operation: AuditDTO["operation"];
+  sources: number;
+}) {
   const { t } = useTranslation();
   return (
     <Tooltip>
@@ -548,29 +551,51 @@ function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: 
             <CornerDownRight className="size-3 shrink-0" />
             <span className="truncate" title={upstreamModel}>{upstreamModel}</span>
           </span>
+          {clientIp ? (
+            <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground/80">
+              <Globe2 className="size-3 shrink-0" />
+              <span className="truncate font-mono" title={clientIp}>{clientIp}</span>
+            </span>
+          ) : null}
         </button>
       </TooltipTrigger>
       <TooltipContent className="w-72 max-w-[calc(100vw-2rem)] space-y-1.5 py-2" side="top" align="start">
-        <div className="grid grid-cols-[auto_1fr] items-start gap-x-3">
-          <span className="text-primary-foreground/65">{t("audits.actualModel")}</span>
-          <span className="break-all text-right">{upstreamModel}</span>
-        </div>
-        <div className="grid grid-cols-[auto_1fr] gap-x-3">
-          <span className="text-primary-foreground/65">{t("audits.owningAccount")}</span>
-          <span className="truncate text-right" title={account}>{account}</span>
-        </div>
-        <div className="grid grid-cols-[auto_1fr] gap-x-3">
-          <span className="text-primary-foreground/65">{t("audits.owningKey")}</span>
-          <span className="truncate text-right" title={clientKey}>{clientKey}</span>
-        </div>
+        <RouteDetailRow label={t("audits.channelProtocol")} value={`${providerLabel(provider)} · ${auditProtocolLabel(operation)}`} />
+        <RouteDetailRow label={t("audits.requestId")} value={requestId} breakAll />
+        {clientIp ? <RouteDetailRow label={t("audits.clientIp")} value={clientIp} breakAll /> : null}
+        <RouteDetailRow label={t("audits.actualModel")} value={upstreamModel} breakAll />
+        <RouteDetailRow label={t("audits.owningAccount")} value={account} />
+        <RouteDetailRow label={t("audits.owningKey")} value={clientKey} />
+        {sources > 0 ? (
+          <RouteDetailRow label={t("audits.sourcesLabel")} value={String(sources)} />
+        ) : null}
       </TooltipContent>
     </Tooltip>
   );
 }
 
+function RouteDetailRow({ label, value, breakAll = false }: { label: string; value: string; breakAll?: boolean }) {
+  return (
+    <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 text-xs font-normal leading-4">
+      <span className="text-primary-foreground/65">{label}</span>
+      <span className={cn("text-right", breakAll ? "break-all" : "truncate")} title={value}>{value}</span>
+    </div>
+  );
+}
+
 function UsageDetails({ audit, locale }: { audit: AuditDTO; locale: string }) {
   const { t } = useTranslation();
-  if (audit.operation === "compaction" && audit.totalTokens === 0) {
+  const view = buildAuditUsageView(audit, (value) => formatNumber(value, locale), {
+    input: t("audits.input"),
+    output: t("audits.output"),
+    cached: t("audits.cached"),
+    reasoning: t("audits.reasoning"),
+    mediaInput: t("audits.mediaInput"),
+    mediaOutput: t("audits.mediaOutput"),
+    imageCount: (count) => t("audits.imageCount", { count }),
+    secondsCount: (count) => t("audits.secondsCount", { count }),
+  });
+  if (view.mode === "compaction") {
     return (
       <div className="flex h-[52px] w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-[11px]">
         <Minimize2 className="size-3.5 shrink-0 text-muted-foreground" />
@@ -581,67 +606,79 @@ function UsageDetails({ audit, locale }: { audit: AuditDTO; locale: string }) {
       </div>
     );
   }
-  if (audit.operation === "video") {
-    return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.secondsCount", { count: audit.mediaOutputSeconds })} />;
-  }
-  if (audit.operation === "tts" || audit.operation === "stt" || audit.operation === "realtime" || audit.operation === "voice") {
+  if (view.mode === "duration") {
     return (
       <div className="flex h-[52px] w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-[11px]">
         <div className="min-w-0">
           <p className="truncate font-medium">{t(`audits.operations.${audit.operation}`)}</p>
-          <p className="truncate text-muted-foreground">{(audit.durationMs / 1000).toFixed(2)}s</p>
+          <p className="truncate text-muted-foreground">{view.durationSeconds}s</p>
         </div>
       </div>
     );
   }
-  if (audit.operation === "image" || audit.operation === "image_edit" || audit.mediaInputImages > 0 || audit.mediaOutputImages > 0) {
-    return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.imageCount", { count: audit.mediaOutputImages })} />;
-  }
-  const items = [
-    { label: t("audits.input"), value: audit.inputTokens },
-    { label: t("audits.output"), value: audit.outputTokens },
-    { label: t("audits.cached"), value: audit.cachedInputTokens },
-    { label: t("audits.reasoning"), value: audit.reasoningTokens },
-  ];
   return (
-    <div className="w-full">
-      <div className="grid grid-cols-2 gap-1">
-        {items.map((item) => (
-          <div key={item.label} className="flex h-6 min-w-0 items-center justify-between gap-2 rounded-md bg-muted/45 px-2 text-[11px]">
-            <span className="text-muted-foreground">{item.label}</span>
-            <span className="font-medium tabular-nums">{formatNumber(item.value, locale)}</span>
-          </div>
-        ))}
-      </div>
-      {audit.numSourcesUsed > 0 ? (
-        <div className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-foreground">
-          <span>{t("audits.sources", { count: audit.numSourcesUsed })}</span>
+    <div className="w-full space-y-1">
+      {view.mediaItems?.length ? (
+        <div className="grid grid-cols-2 gap-1">
+          {view.mediaItems.map((item) => (
+            <UsageMetric key={item.key} label={item.label} value={item.value} />
+          ))}
+        </div>
+      ) : null}
+      {view.tokenItems?.length ? (
+        <div className="grid grid-cols-2 gap-1">
+          {view.tokenItems.map((item) => (
+            <UsageMetric
+              key={item.key}
+              label={item.label}
+              value={item.value}
+              reasoningEffort={item.key === "reasoning" ? audit.reasoningEffort : undefined}
+            />
+          ))}
         </div>
       ) : null}
     </div>
   );
 }
 
-function MediaUsage({ input, output }: { input: string; output: string }) {
+function UsageMetric({ label, value, reasoningEffort }: {
+  label: string;
+  value: string;
+  reasoningEffort?: AuditDTO["reasoningEffort"];
+}) {
   const { t } = useTranslation();
+  const fullLabel = reasoningEffort ? `${label} · ${t(`audits.reasoningEfforts.${reasoningEffort}`)}` : label;
   return (
-    <div className="grid w-full gap-1">
-      <div className="flex h-6 items-center justify-between gap-3 rounded-md bg-muted/45 px-2 text-[11px]">
-        <span className="text-muted-foreground">{t("audits.mediaInput")}</span>
-        <span className="font-medium tabular-nums">{input}</span>
-      </div>
-      <div className="flex h-6 items-center justify-between gap-3 rounded-md bg-muted/45 px-2 text-[11px]">
-        <span className="text-muted-foreground">{t("audits.output")}</span>
-        <span className="font-medium tabular-nums">{output}</span>
-      </div>
+    <div className="flex h-6 min-w-0 items-center justify-between gap-2 rounded-md bg-muted/45 px-2 text-[11px]">
+      <span className="flex min-w-0 items-center gap-1" title={fullLabel}>
+        <span className="truncate text-muted-foreground">{label}</span>
+        {reasoningEffort ? (
+          <span className={cn("shrink-0 font-medium", reasoningEffortTone(reasoningEffort))}>
+            · {t(`audits.reasoningEfforts.${reasoningEffort}`)}
+          </span>
+        ) : null}
+      </span>
+      <span className="truncate font-medium tabular-nums" title={value}>{value}</span>
     </div>
   );
+}
+
+function reasoningEffortTone(effort: NonNullable<AuditDTO["reasoningEffort"]>): string {
+  switch (effort) {
+    case "none": return "text-muted-foreground";
+    case "low": return "text-sky-600 dark:text-sky-400";
+    case "medium": return "text-amber-600 dark:text-amber-400";
+    case "high": return "text-orange-600 dark:text-orange-400";
+    case "xhigh": return "text-rose-600 dark:text-rose-400";
+    case "auto": return "text-violet-600 dark:text-violet-400";
+    case "fixed": return "text-indigo-600 dark:text-indigo-400";
+  }
 }
 
 function StatusCode({ statusCode, hasError = false }: { statusCode: number; hasError?: boolean }) {
   const tone = statusTone(statusCode, hasError);
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-xs tabular-nums", tone.text)}>
+    <span className={cn("inline-flex items-center gap-1 text-[10px] leading-4 tabular-nums", tone.text)}>
       <span className={cn("size-1.5 rounded-full", tone.dot)} />
       {statusCode || "-"}
     </span>
@@ -658,7 +695,7 @@ function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void })
   const content = (
     <>
       {showErrorLabel ? (
-        <span className="inline-flex items-center gap-1.5 text-xs tabular-nums text-amber-700 dark:text-amber-300">
+        <span className="inline-flex items-center gap-1 text-[10px] leading-4 tabular-nums text-amber-700 dark:text-amber-300">
           <span className="size-1.5 rounded-full bg-amber-500" />
           {audit.statusCode > 0 ? `${audit.statusCode} · ` : ""}{t("audits.errorLabel")}
         </span>
@@ -668,14 +705,20 @@ function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void })
       <span className="block whitespace-nowrap text-[10px] text-muted-foreground">{mode}</span>
     </>
   );
-  if (!audit.errorCode && audit.attemptCount === 0) return <div className="space-y-0.5 text-center">{content}</div>;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button type="button" className="group space-y-0.5 rounded-md text-center outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&>span:last-child]:underline-offset-2 hover:[&>span:last-child]:text-foreground hover:[&>span:last-child]:underline" aria-label={t("audits.openDiagnostics")} onClick={onOpen}>{content}</button>
+        <button
+          type="button"
+          className="group inline-flex flex-col items-center justify-center space-y-0.5 rounded-md px-2 py-1 text-center outline-none transition-colors hover:bg-muted/80 focus-visible:ring-2 focus-visible:ring-ring/50 [&>span:last-child]:underline-offset-2 hover:[&>span:last-child]:text-foreground hover:[&>span:last-child]:underline cursor-pointer"
+          aria-label={t("audits.viewDetails")}
+          onClick={onOpen}
+        >
+          {content}
+        </button>
       </TooltipTrigger>
       <TooltipContent className="max-w-80 whitespace-normal break-words text-left leading-5" side="top">
-        {audit.errorCode || t("audits.openDiagnostics")}
+        {audit.errorCode || t("audits.viewDetails")}
       </TooltipContent>
     </Tooltip>
   );
@@ -697,6 +740,22 @@ function providerLabel(provider: AuditDTO["provider"]): string {
       return "Grok Web";
     case "grok_console":
       return "Grok Console";
+  }
+}
+
+function auditProtocolLabel(operation: AuditDTO["operation"]): string {
+  switch (operation) {
+    case "responses": return "Responses";
+    case "compaction": return "Responses Compact";
+    case "chat": return "Chat Completions";
+    case "messages": return "Anthropic Messages";
+    case "image":
+    case "image_edit": return "Images";
+    case "video": return "Videos";
+    case "tts": return "Audio Speech";
+    case "stt": return "Audio Transcriptions";
+    case "realtime": return "Realtime";
+    case "voice": return "Voice";
   }
 }
 

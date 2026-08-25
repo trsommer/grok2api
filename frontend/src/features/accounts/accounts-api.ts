@@ -102,6 +102,7 @@ export type AccountDTO = {
   failureCount: number;
   cooldownUntil?: string;
   lastError?: string;
+  enabledDoesNotClearCooldown?: boolean;
   lastUsedAt?: string;
   linkedAccountId?: string;
   linkedAccountName?: string;
@@ -123,7 +124,7 @@ export type LinkedAccountDTO = {
 
 export type AccountUpdateInput = {
   name: string;
-  enabled: boolean;
+  enabled?: boolean;
   priority: number;
   maxConcurrent: number;
   minimumRemaining: number;
@@ -193,6 +194,7 @@ const accountValidator = hasShape({
   egressNodeId: isOptional(isString), egressAssignmentMode: isOptional(isOneOf("manual", "auto")),
   lastRefreshErrorStatus: isOptional(isNumber), lastRefreshErrorCode: isOptional(isString), lastRefreshErrorMessage: isOptional(isString), lastRefreshErrorResponse: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
+  enabledDoesNotClearCooldown: isOptional(isBoolean),
   linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")), linkedAccounts: isOptional(isArrayOf(linkedAccountValidator)),
   createdAt: isString, billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
 });
@@ -309,6 +311,10 @@ export function refreshAccountToken(id: string): Promise<AccountDTO> {
   return apiRequest(`/api/admin/v1/accounts/${id}/refresh-token`, { method: "POST" }, decodeAccount);
 }
 
+export function clearAccountCooldown(id: string): Promise<AccountDTO> {
+  return apiRequest(`/api/admin/v1/accounts/${id}/clear-cooldown`, { method: "POST" }, decodeAccount);
+}
+
 export function acceptWebAccountTerms(id: string): Promise<{ completed: boolean }> {
   return apiRequest(`/api/admin/v1/accounts/web/${id}/accept-terms`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
 }
@@ -373,6 +379,8 @@ export type WebAccountScriptsInput =
 export type AccountImportResultDTO = {
   created: number;
   updated: number;
+  skipped: number;
+  failed: number;
   synced: number;
   syncFailed: number;
 };
@@ -524,7 +532,7 @@ export function convertWebAccountsToBuild(input: BuildConversionInput, onProgres
 }
 
 export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<WebConsoleSyncResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
+  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "failed", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
@@ -534,19 +542,19 @@ export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?:
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/import", body, ["created", "updated", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
+  return runAccountTask("/api/admin/v1/accounts/import", body, ["created", "updated", "skipped", "failed", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function importWebAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/web/import", body, ["created", "updated", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
+  return runAccountTask("/api/admin/v1/accounts/web/import", body, ["created", "updated", "skipped", "failed", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function importConsoleAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/console/import", body, ["created", "updated", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
+  return runAccountTask("/api/admin/v1/accounts/console/import", body, ["created", "updated", "skipped", "failed", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function refreshAccountQuota(id: string): Promise<AccountDTO> {

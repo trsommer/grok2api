@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
@@ -141,9 +142,85 @@ func TestSelectorQualityProbePinsAccountToRequestedEgressNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Release()
 	if lease.Credential.ID != second.ID || lease.Credential.ID == first.ID {
 		t.Fatalf("selected account=%d, want=%d on node=%d", lease.Credential.ID, second.ID, secondNode.ID)
+	}
+	lease.Release()
+
+	if _, err := accounts.UpsertEgressLeaseBlock(ctx, account.EgressLeaseBlock{
+		AccountID: second.ID, NodeID: secondNode.ID, Reason: "hard_tps", Version: "selector-lease-0001", CooldownUntil: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selector = NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	if _, err := selector.AcquirePinnedForKey(ctx, account.ProviderBuild, second.ID, 0, "grok-test", "", true, clientkeydomain.AccountScope{}); err == nil {
+		t.Fatal("ordinary pinned inference ignored the active egress lease block")
+	} else {
+		var unavailable *SelectionUnavailableError
+		if !errors.As(err, &unavailable) || unavailable.Reason != SelectionCooling {
+			t.Fatalf("ordinary pinned error = %v", err)
+		}
+	}
+	recoveryLease, err := selector.AcquirePinnedForQualityProbe(ctx, account.ProviderBuild, second.ID, 0, "grok-test", "", clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatalf("quality recovery did not bypass only the lease block: %v", err)
+	}
+	defer recoveryLease.Release()
+	if recoveryLease.Credential.ID != second.ID || recoveryLease.Credential.EgressNodeID != secondNode.ID {
+		t.Fatalf("quality recovery lease = %#v", recoveryLease.Credential)
+	}
+}
+
+func TestSelectorCoolsUnboundAccountOnObservedLeaseAndAllowsRecoveryProbe(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-dynamic-egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	egressNodes := relational.NewEgressRepository(database)
+	node, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{
+		Name: "dynamic", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "encrypted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "unbound", SourceKey: "unbound", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.EgressNodeID != 0 {
+		t.Fatalf("test account unexpectedly bound to node %d", credential.EgressNodeID)
+	}
+	if _, err := accounts.UpsertEgressLeaseBlock(ctx, account.EgressLeaseBlock{
+		AccountID: credential.ID, NodeID: node.ID, Reason: "hard_tps", Version: "selector-dynamic-0001", CooldownUntil: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	if _, err := selector.AcquirePinnedForKey(ctx, account.ProviderBuild, credential.ID, 0, "grok-test", "", true, clientkeydomain.AccountScope{}); err == nil {
+		t.Fatal("ordinary inference ignored the unbound account's active observed lease")
+	} else {
+		var unavailable *SelectionUnavailableError
+		if !errors.As(err, &unavailable) || unavailable.Reason != SelectionCooling {
+			t.Fatalf("ordinary pinned error = %v", err)
+		}
+	}
+	recoveryLease, err := selector.AcquirePinnedForQualityProbe(ctx, account.ProviderBuild, credential.ID, 0, "grok-test", "", clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatalf("quality recovery did not bypass the observed lease block: %v", err)
+	}
+	defer recoveryLease.Release()
+	if recoveryLease.Credential.ID != credential.ID || recoveryLease.Credential.EgressNodeID != 0 {
+		t.Fatalf("quality recovery lease = %#v", recoveryLease.Credential)
 	}
 }
 
@@ -592,6 +669,143 @@ func TestSelectorKeepsWebQuotaModesIsolated(t *testing.T) {
 	defer lease.Release()
 	if lease.Credential.ID != value.ID || lease.QuotaMode != "auto" {
 		t.Fatalf("lease = %#v", lease)
+	}
+}
+
+func TestSelectorUsesTierSpecificWebImageEditQuotaAndPrefersBasic(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-web-image-edit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	models := relational.NewModelRepository(database)
+	create := func(name string, tier account.WebTier, priority int) account.Credential {
+		value, _, createErr := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted",
+			AuthStatus: account.AuthStatusActive, Priority: priority, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		return value
+	}
+	basic := create("basic-edit", account.WebTierBasic, 1)
+	super := create("super-edit", account.WebTierSuper, 100)
+	now := time.Now().UTC()
+	resetAt := now.Add(time.Hour)
+	if err := accounts.SaveQuotaWindows(ctx, basic.ID, account.WebTierBasic, now, []account.QuotaWindow{
+		{AccountID: basic.ID, Mode: account.QuotaModeWebImagePro, Remaining: 4, Total: 4, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream},
+		{AccountID: basic.ID, Mode: account.QuotaModeWebImageEdit, Remaining: 0, Total: 0, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.SaveQuotaWindows(ctx, super.ID, account.WebTierSuper, now, []account.QuotaWindow{
+		{AccountID: super.ID, Mode: account.QuotaModeWebImagePro, Remaining: 20, Total: 20, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream},
+		{AccountID: super.ID, Mode: account.QuotaModeWebImageEdit, Remaining: 8, Total: 8, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an old Basic snapshot from before image editing was exposed to
+	// that tier. Super already reports the capability.
+	if err := models.ReplaceAccountCapabilities(ctx, basic.ID, []string{"grok-chat-fast"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, super.ID, []string{"grok-chat-fast", "imagine-image-edit"}, now); err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierOrder{order: []account.WebTier{
+		account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy,
+	}}, time.Hour, time.Second, time.Minute)
+	lease, err := selector.Acquire(ctx, account.ProviderWeb, 0, "imagine-image-edit", account.QuotaModeWebImageEdit, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != basic.ID {
+		t.Fatalf("selected account = %d, want stale-snapshot Basic %d", lease.Credential.ID, basic.ID)
+	}
+	if lease.QuotaMode != account.QuotaModeWebImagePro {
+		t.Fatalf("quota mode = %q, want %q", lease.QuotaMode, account.QuotaModeWebImagePro)
+	}
+}
+
+func TestSelectorAllowsBasicOnlyForConfirmedWebVideoQuota(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-web-basic-video.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	models := relational.NewModelRepository(database)
+	basic, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+		Name: "basic-video", SourceKey: "basic-video", EncryptedAccessToken: "encrypted",
+		AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := accounts.SaveQuotaWindows(ctx, basic.ID, account.WebTierBasic, now, []account.QuotaWindow{{
+		AccountID: basic.ID, Mode: account.QuotaModeWebVideo720p, Remaining: 1, Total: 1,
+		SyncedAt: &now, Source: account.QuotaSourceUpstream,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, basic.ID, []string{"grok-chat-fast"}, now); err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), webVideoTierOrder{}, time.Hour, time.Second, time.Minute)
+	lease, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo720p, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Credential.ID != basic.ID || lease.QuotaMode != account.QuotaModeWebVideo720p {
+		t.Fatalf("720p Basic video lease = %#v", lease)
+	}
+	lease.Release()
+	if _, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo, "", nil, false); err == nil {
+		t.Fatal("Basic account was selected for an unverified Web video quota product")
+	}
+}
+
+func TestSelectorWebCatalogCapabilityStillEnforcesTier(t *testing.T) {
+	candidate := account.RoutingCandidate{
+		Credential:           account.Credential{Provider: account.ProviderWeb, WebTier: account.WebTierBasic},
+		ModelCapabilityKnown: true,
+	}
+	imageSelector := NewSelector(nil, memory.NewConcurrencyLimiter(), nil, staticTierOrder{order: []account.WebTier{
+		account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy,
+	}}, time.Hour, time.Second, time.Minute)
+	if !imageSelector.candidateSupportsModel(account.ProviderWeb, "imagine-image-edit", account.QuotaModeWebImageEdit, candidate) {
+		t.Fatal("recognized Basic image-edit capability was blocked by a stale snapshot")
+	}
+	videoSelector := NewSelector(nil, memory.NewConcurrencyLimiter(), nil, staticTierOrder{order: []account.WebTier{
+		account.WebTierSuper, account.WebTierHeavy,
+	}}, time.Hour, time.Second, time.Minute)
+	if videoSelector.candidateSupportsModel(account.ProviderWeb, "grok-imagine-video", account.QuotaModeWebVideo, candidate) {
+		t.Fatal("Basic account bypassed the video tier requirement")
+	}
+}
+
+func TestImageQuotaFinalizationKeepsEffectiveConsumptionFence(t *testing.T) {
+	refreshMode, decrementMode, availabilityMode := quotaFinalizationModes(account.QuotaModeWebImagePro, account.QuotaGroupWebImagine)
+	if refreshMode != account.QuotaGroupWebImagine || decrementMode != account.QuotaModeWebImagePro || availabilityMode != "" {
+		t.Fatalf("refresh=%q decrement=%q availability=%q", refreshMode, decrementMode, availabilityMode)
+	}
+	refreshMode, decrementMode, availabilityMode = quotaFinalizationModes("weekly", account.QuotaGroupWebImagine)
+	if refreshMode != "weekly" || decrementMode != "weekly" || availabilityMode != account.QuotaGroupWebImagine {
+		t.Fatalf("shared weekly refresh=%q decrement=%q availability=%q", refreshMode, decrementMode, availabilityMode)
 	}
 }
 
@@ -1339,6 +1553,89 @@ func (s *recordingStickyStore) Expiries() []time.Time {
 	return append([]time.Time(nil), s.expiries...)
 }
 
+func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "missing-thinking.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "no-think", SourceKey: "no-think", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
+	before := time.Now().UTC()
+	if action, err := selector.markMissingThinking(ctx, credential, time.Hour); err != nil || action != missingThinkingPenaltyCooled {
+		t.Fatalf("first penalty = (%s, %v)", action, err)
+	}
+	first, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Enabled || first.LastError != lastErrorMissingThinking || first.CooldownUntil == nil {
+		t.Fatalf("first strike = %#v", first)
+	}
+	if wait := first.CooldownUntil.Sub(before); wait < 50*time.Minute || wait > 70*time.Minute {
+		t.Fatalf("first cooldown = %s", wait)
+	}
+	if action, err := selector.markMissingThinking(ctx, first, time.Hour); err != nil || action != missingThinkingPenaltyUnchanged {
+		t.Fatalf("in-cooldown penalty = (%s, %v)", action, err)
+	}
+	stillCooling, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stillCooling.Enabled {
+		t.Fatal("in-cooldown second call must not disable")
+	}
+	expired := time.Now().UTC().Add(-time.Second)
+	stillCooling.CooldownUntil = &expired
+	if action, err := selector.markMissingThinking(ctx, stillCooling, time.Hour); err != nil || action != missingThinkingPenaltyDisabled {
+		t.Fatalf("second penalty = (%s, %v)", action, err)
+	}
+	second, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Enabled {
+		t.Fatalf("second strike after cooldown must disable, got %#v", second)
+	}
+	if second.LastError != lastErrorMissingThinkingDisabled {
+		t.Fatalf("disabled last error = %q", second.LastError)
+	}
+
+	ok, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "recovered", SourceKey: "recovered", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action, err := selector.markMissingThinking(ctx, ok, time.Hour); err != nil || action != missingThinkingPenaltyCooled {
+		t.Fatalf("recovery penalty = (%s, %v)", action, err)
+	}
+	cooled, err := accounts.Get(ctx, ok.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector.MarkSuccess(ctx, cooled)
+	kept, err := accounts.Get(ctx, ok.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.LastError != lastErrorMissingThinking || kept.CooldownUntil != nil || kept.FailureCount != 0 {
+		t.Fatalf("success must keep thinking strike and clear cooldown, got %#v", kept)
+	}
+}
+
 func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "soft-network.db"))
@@ -1386,6 +1683,151 @@ func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	if hard.CooldownUntil == nil || hard.CooldownUntil.Sub(time.Now().UTC()) < 20*time.Second {
 		t.Fatalf("hard cooldown too short: %v", hard.CooldownUntil)
 	}
+
+	before = time.Now().UTC()
+	if err := selector.markSoftFailure(ctx, hard, http.StatusGatewayTimeout, 0); err != nil {
+		t.Fatal(err)
+	}
+	soft5xx, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if soft5xx.FailureCount != hard.FailureCount {
+		t.Fatalf("soft 5xx failure count = %d, want preserved %d", soft5xx.FailureCount, hard.FailureCount)
+	}
+	if soft5xx.LastError != "upstream status 504" {
+		t.Fatalf("soft 5xx diagnostic = %q", soft5xx.LastError)
+	}
+	if soft5xx.CooldownUntil == nil {
+		t.Fatal("soft 5xx did not set cooldown")
+	}
+	cooldown = soft5xx.CooldownUntil.Sub(before)
+	if cooldown < 4*time.Second || cooldown > 6*time.Second {
+		t.Fatalf("soft 5xx cooldown = %s, want ~5s", cooldown)
+	}
+
+	before = time.Now().UTC()
+	if err := selector.markSoftFailure(ctx, soft5xx, http.StatusServiceUnavailable, 12*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	softRetryAfter, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if softRetryAfter.FailureCount != hard.FailureCount {
+		t.Fatalf("Retry-After soft failure count = %d, want preserved %d", softRetryAfter.FailureCount, hard.FailureCount)
+	}
+	if softRetryAfter.CooldownUntil == nil {
+		t.Fatal("Retry-After soft failure did not set cooldown")
+	}
+	cooldown = softRetryAfter.CooldownUntil.Sub(before)
+	if cooldown < 11*time.Second || cooldown > 13*time.Second {
+		t.Fatalf("Retry-After soft cooldown = %s, want ~12s", cooldown)
+	}
+
+	before = time.Now().UTC()
+	selector.MarkFailure(ctx, softRetryAfter, 0, 0)
+	preserved, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.FailureCount != hard.FailureCount {
+		t.Fatalf("ordinary soft failure count = %d, want preserved %d", preserved.FailureCount, hard.FailureCount)
+	}
+	if preserved.CooldownUntil == nil {
+		t.Fatal("ordinary soft failure did not set cooldown")
+	}
+	cooldown = preserved.CooldownUntil.Sub(before)
+	if cooldown < 4*time.Second || cooldown > 6*time.Second {
+		t.Fatalf("ordinary soft cooldown = %s, want ~5s", cooldown)
+	}
+
+	before = time.Now().UTC()
+	if err := selector.MarkFailureAfterSuccess(ctx, preserved, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.FailureCount != 0 {
+		t.Fatalf("after-success soft failure count = %d, want 0", reset.FailureCount)
+	}
+	if reset.CooldownUntil == nil {
+		t.Fatal("after-success soft failure did not set cooldown")
+	}
+	cooldown = reset.CooldownUntil.Sub(before)
+	if cooldown < 4*time.Second || cooldown > 6*time.Second {
+		t.Fatalf("after-success soft cooldown = %s, want ~5s", cooldown)
+	}
+}
+
+func TestConsoleRateLimitReconciliationUsesNonAccumulatingCooldown(t *testing.T) {
+	tests := []struct {
+		name             string
+		status           int
+		state            accountapp.RateLimitReconcileState
+		err              error
+		wantFailureCount int
+	}{
+		{name: "quota confirmed available", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 3},
+		{name: "another replica refreshing", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileRefreshing, wantFailureCount: 3},
+		{name: "quota probe inconclusive", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileInconclusive, err: errors.New("usage probe failed"), wantFailureCount: 3},
+		{name: "payment failure keeps hard penalty", status: http.StatusPaymentRequired, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-rate-limit-soft.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+			if err := database.InitializeSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+			accounts := relational.NewAccountRepository(database)
+			credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+				Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO,
+				Name: "console-soft", SourceKey: "console-soft", EncryptedAccessToken: "encrypted",
+				Enabled: true, AuthStatus: account.AuthStatusActive,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 3, nil, "prior failures", false); err != nil {
+				t.Fatal(err)
+			}
+			credential, err = accounts.Get(ctx, credential.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
+			service := &Service{selector: selector}
+			before := time.Now().UTC()
+
+			service.applyRateLimitReconciliation(ctx, credential, test.status, 12*time.Second, test.state, test.err)
+
+			updated, err := accounts.Get(ctx, credential.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.FailureCount != test.wantFailureCount {
+				t.Fatalf("failure count = %d, want %d", updated.FailureCount, test.wantFailureCount)
+			}
+			if updated.CooldownUntil == nil {
+				t.Fatal("expected Console 429 cooldown")
+			}
+			cooldown := updated.CooldownUntil.Sub(before)
+			if test.status == http.StatusTooManyRequests {
+				if cooldown < 11*time.Second || cooldown > 13*time.Second {
+					t.Fatalf("cooldown = %s, want ~12s", cooldown)
+				}
+			} else if cooldown < 2*time.Minute {
+				t.Fatalf("hard failure cooldown = %s, want at least 2m", cooldown)
+			}
+		})
+	}
 }
 
 type batchConcurrencyLimiter struct {
@@ -1416,6 +1858,19 @@ type staticTierOrder struct{ order []account.WebTier }
 
 func (value staticTierOrder) TierOrder(account.Provider, string) []account.WebTier {
 	return value.order
+}
+
+type webVideoTierOrder struct{}
+
+func (webVideoTierOrder) TierOrder(account.Provider, string) []account.WebTier {
+	return []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}
+}
+
+func (webVideoTierOrder) TierOrderForQuotaMode(_ account.Provider, _ string, quotaMode string) []account.WebTier {
+	if quotaMode == account.QuotaModeWebVideo720p {
+		return []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}
+	}
+	return []account.WebTier{account.WebTierSuper, account.WebTierHeavy}
 }
 
 func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func(), bool, error) {

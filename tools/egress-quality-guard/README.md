@@ -14,15 +14,18 @@ your own traffic before allowing automatic quarantine.
 
 - Supports Grok Build streaming requests after egress nodes and request audits are configured in grok2api.
 - At least one schedulable Grok Build account must be able to serve the probe model. The account does not have to be bound to every managed node.
-- The built-in thinking guard is enforced only when the backend recognizes the configured Build model as reasoning-capable. Keep the default `grok-4.5` or another verified reasoning model when missing-thinking detection is required; unknown and non-reasoning models retain marker/TPS checks without this signal.
+- The built-in thinking guard is enforced only when the backend recognizes the configured Build model as reasoning-capable. Keep the default `grok-4.6` or another verified reasoning model when missing-thinking detection is required; unknown and non-reasoning models retain marker/TPS checks without this signal.
 - The main service automatically provisions a non-exportable system probe identity. The sidecar reaches only a scoped internal API over the Compose network.
 - Classification is heuristic evidence. It cannot prove that upstream model capability changed and does not replace application-level regression tests.
 
 ## How it works
 
 1. Passive mode polls recent successful streaming audits and computes the same
-   speed shown by the grok2api panel: `output / (duration - first token)`.
-   `output` intentionally includes reasoning tokens.
+   speed shown by the grok2api panel: `output / generation window`.
+   `output` includes reasoning tokens. The window is `duration - first token`,
+   except when that tail is both shorter than the first-token wait and under
+   1s: then the full duration is used so buffered thinking is not assigned to
+   a few milliseconds.
 2. Active mode calls a quality-guard-only internal probe endpoint. The scoped
    credential cannot access account exports, administrator management, or the
    rest of the administrator API.
@@ -39,6 +42,20 @@ your own traffic before allowing automatic quarantine.
 6. Quarantined nodes remain available only to administrator probes. Recovery
    records a generic connectivity probe for diagnosis, then uses the real
    model-quality probe as the authority before re-enabling the node.
+
+Account-bound proxy templates such as Resin usernames containing `{account}`
+render a distinct sticky lease for each account. Scheduled node probes remain
+suppressed because one lease cannot represent its siblings. A passive anomaly
+removes only the audited account lease; after the hold, recovery pins a probe to
+that same account and node, renews an unhealthy hold, and clears the durable
+marker only with a matching CAS version. Routing stops enforcing a hold after
+its deadline, so a stopped sidecar cannot strand an account indefinitely.
+Rebinding an account atomically removes its old marker. If identity or the lease
+API is unavailable, the guard falls back to observation and never disables the
+shared node. Rendered proxy usernames and credentials never cross the API.
+Lease reconciliation uses opaque keyset pagination and scans the complete
+durable set. Recovery probes are capped per cycle and retry with exponential
+backoff, so a large expired queue cannot monopolize one guard cycle.
 
 The public inference API cannot request a specific egress node or bypass a
 disabled node. This capability is confined to the authenticated internal route.
@@ -109,6 +126,10 @@ probe prompt, or model response body.
 
 - Never deletes a node or changes account bindings.
 - Never restores a node disabled by an operator.
+- Never applies whole-node quarantine to an account-bound `{account}` proxy. A
+  legacy quarantine still owned by the guard is released during reconciliation.
+- Lease recovery is pinned to the same account and node and uses an opaque CAS
+  version so stale probes cannot clear a newer quarantine.
 - Refuses to quarantine below `qualityGuard.minimumHealthyNodes`.
 - Strict mode overrides that floor rather than scheduling an unverified exit.
 - Uses an exclusive process lock to prevent duplicate guards.
@@ -126,7 +147,7 @@ copy, select, or configure a Client Key for the guard:
 ```yaml
 qualityGuard:
   enabled: true
-  model: "grok-4.5"
+  model: "grok-4.6"
   mode: hybrid
   activeInterval: 30m
   passivePollInterval: 5s
@@ -181,6 +202,15 @@ After changing the base `qualityGuard` settings in `config.yaml`, run
 `docker compose --profile quality-guard restart grok2api egress-quality-guard`
 so the main service regenerates the bootstrap. Policy changes saved in the
 admin page still hot-reload without a restart.
+
+The sidecar talks to grok2api at `GROK2API_BASE_URL`, which defaults to
+`http://grok2api:8000` on the Compose network. Set it when the main service is
+renamed or published on host networking, for example
+`GROK2API_BASE_URL=http://127.0.0.1:8000`.
+
+Missing-thinking **request-path withhold/retry** (`qualityGuard.requestRetry`)
+runs inside the grok2api gateway, not this sidecar. See `config.example.yaml`
+and the root README.
 
 Verify the managed nodes, model, and minimum healthy-node count before leaving
 the sidecar running. Never commit the state volume or

@@ -15,13 +15,22 @@ Token/s，因此建议先观察 JSON 日志，再根据实际流量调整阈值�
 
 ## 工作流程
 
-1. 被动检测每 5 秒读取普通成功流式请求的新增审计，并按 grok2api 面板同口径的 `输出 Token / (总耗时 - 首字耗时)` 计算速度；输出 Token 故意包含 Reasoning Token。
+1. 被动检测每 5 秒读取普通成功流式请求的新增审计，并按 grok2api 面板同口径计算速度：输出 Token 包含 Reasoning Token，分母是生成窗口。默认是 `总耗时 - 首字耗时`；若这段尾巴既短于首字等待又不足 1 秒，则改用全程，避免加密思考被挤进最后几十毫秒。
 2. 主动检测调用质量守护专用内部探测接口；该凭据不能导出账号、管理管理员或访问其他管理 API。
 3. grok2api 优先使用明确绑定到该节点的账号；如果这些账号不可调度，则借用任意健康账号，但仍强制实际请求走被测节点，再发送固定流式 Prompt。即使其他 Provider 暴露同名模型，后端也会把探测路由固定为 Grok Build。
 4. 普通真实请求达到硬阈值时立即隔离；达到软阈值时触发一次固定 Prompt 主动复测。
 5. 主动复测达到硬阈值会立即隔离；主动软异常必须达到配置的连续次数。
 6. 隔离节点仍可接受管理员探测，但不会承载普通用户请求。
 7. 冷却结束后记录一次通用连接探测用于诊断，再以真实模型质量探测作为恢复判据，账号绑定保持不变。
+
+Resin 用户名等代理模板包含 `{account}` 时，同一逻辑节点会按账号生成不同的粘性租约。
+这类节点不会执行无法代表全部租约的定时节点探测；被动审计出现异常时，后端只临时移出该
+审计关联的账号租约。冷却到期后，恢复探针固定使用同一账号与同一节点；异常会续期，健康时
+通过版本校验清理持久化标记。路由在隔离期限到期后不再强制摘流，避免 sidecar 停止时让孤儿
+状态永久卡住账号。账号换绑会原子清理旧标记；sidecar 或接口异常时只记录观测，绝不回退为
+整节点禁用。内部接口只传账号 ID、节点 ID 和随机版本号，不返回渲染后的 Resin 用户名或代理凭据。
+租约对账采用不透明游标完整分页；每轮恢复探针有固定上限，失败后按指数退避，避免大量到期租约
+长期占满单次守护循环。
 
 普通 `/v1/*` 请求不能指定出口节点，也不能绕过节点禁用状态。
 仅发生在质量探测中的模糊 403 不会冷却借用账号；明确的凭据失效、账号封禁和额度信号仍按原有规则处理。
@@ -70,6 +79,7 @@ Webhook，确认出口发生变化，再执行一次真实模型质量检测；�
 
 - 不删除节点，不修改账号绑定。
 - 不会恢复管理员手动禁用的节点。
+- 不会对账号绑定的 `{account}` 代理执行整节点隔离；升级前仍由守护程序持有的旧隔离会在状态对账时解除。
 - 启用节点数低于 `qualityGuard.minimumHealthyNodes` 时拒绝继续隔离。
 - 严格模式会覆盖最低健康节点保护：无法确认质量时宁可无可用节点，也不调度可疑出口。
 - 使用进程锁防止重复运行。
@@ -84,7 +94,7 @@ Webhook，确认出口发生变化，再执行一次真实模型质量检测；�
 ```yaml
 qualityGuard:
   enabled: true
-  model: "grok-4.5"
+  model: "grok-4.6"
   mode: hybrid
   activeInterval: 30m
   passivePollInterval: 5s
@@ -129,6 +139,10 @@ docker compose --profile quality-guard up -d --build
 
 以后修改 `config.yaml` 中的 `qualityGuard` 基础配置时，执行
 `docker compose --profile quality-guard restart grok2api egress-quality-guard` 让主程序重新生成 bootstrap。管理页面保存的运行策略仍会热加载，无需重启。
+
+sidecar 通过 `GROK2API_BASE_URL` 访问主程序，Compose 网络默认是 `http://grok2api:8000`。主服务改名或使用 host 网络时需要覆盖，例如 `GROK2API_BASE_URL=http://127.0.0.1:8000`。
+
+缺 thinking 的**请求路径扣住/换号**（`qualityGuard.requestRetry`）在 grok2api 网关内完成，不经过 sidecar。配置见根目录 `config.example.yaml` 与主 README。
 
 先确认受管节点、模型和最低健康节点数正确，再允许 sidecar 长期运行。不要提交状态卷或生产日志。只停止守护程序可执行
 `docker compose --profile quality-guard stop egress-quality-guard`，不会影响主 API。

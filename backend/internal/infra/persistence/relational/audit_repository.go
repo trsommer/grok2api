@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ const (
 	auditInsertBatchSize   = 20
 	auditLookupBatchSize   = 500
 	attemptInsertBatchSize = 40
+	auditPurgeBatchSize    = 1000
 	auditSuccessPredicate  = "status_code >= 200 AND status_code < 300 AND (error_code IS NULL OR error_code = '')"
 	auditSuccessAggregate  = "COALESCE(SUM(CASE WHEN " + auditSuccessPredicate + " THEN 1 ELSE 0 END), 0)"
 )
@@ -96,6 +98,9 @@ func validatePreparedAudit(value preparedAudit) error {
 	if row.ClientKeyID == 0 {
 		return errors.New("client_key_id must be positive")
 	}
+	if row.ClientIP != "" && net.ParseIP(row.ClientIP) == nil {
+		return errors.New("client_ip must be a valid IP address when present")
+	}
 	if row.ModelRouteID == 0 {
 		return errors.New("model_route_id must be positive")
 	}
@@ -122,6 +127,15 @@ func validatePreparedAudit(value preparedAudit) error {
 	}
 	if row.StatusCode < 100 || row.StatusCode > 599 {
 		return errors.New("status_code must be between 100 and 599")
+	}
+	if utf8.RuneCountInString(row.RequestMethod) > 16 {
+		return errors.New("request method exceeds the storage limit")
+	}
+	if utf8.RuneCountInString(row.RequestPath) > 2048 {
+		return errors.New("request path exceeds the storage limit")
+	}
+	if utf8.RuneCountInString(row.RequestHeadersJSON) > 65536 {
+		return errors.New("request headers exceed the storage limit")
 	}
 	attemptNumbers := make(map[int]struct{}, len(value.attempts))
 	for index, attempt := range value.attempts {
@@ -347,11 +361,18 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d", value.RequestID, value.ClientKeyID, value.ModelRouteID, value.CreatedAt.UnixNano())))
 		eventID = fmt.Sprintf("evt_%x", digest[:18])
 	}
+	requestHeadersJSON := "{}"
+	if len(value.RequestHeaders) > 0 {
+		if raw, err := json.Marshal(value.RequestHeaders); err == nil {
+			requestHeadersJSON = string(raw)
+		}
+	}
 	row := requestAuditModel{
-		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160),
+		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160), ClientIP: strings.TrimSpace(value.ClientIP),
 		ModelRouteID: value.ModelRouteID, ModelPublicID: truncate(value.ModelPublicID, 255), ModelUpstreamModel: truncate(value.ModelUpstreamModel, 255),
 		Provider: truncate(provider, 32), Operation: string(operation), UsageSource: string(usageSource),
-		AccountID: value.AccountID, AccountName: truncate(value.AccountName, 160),
+		ReasoningEffort: audit.NormalizeReasoningEffort(value.ReasoningEffort),
+		AccountID:       value.AccountID, AccountName: truncate(value.AccountName, 160),
 		EgressNodeID: value.EgressNodeID, EgressNodeName: truncate(value.EgressNodeName, 160), EgressScope: truncate(value.EgressScope, 32), EgressMode: string(value.EgressMode),
 		StatusCode: value.StatusCode, Streaming: value.Streaming,
 		MediaInputImages: nonNegative(value.MediaInputImages), MediaOutputImages: nonNegative(value.MediaOutputImages), MediaOutputSeconds: nonNegative(value.MediaOutputSeconds),
@@ -360,7 +381,11 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		EstimatedCostInUSDTicks: nonNegative(value.EstimatedCostInUSDTicks), PricingModel: truncate(value.PricingModel, 100), PricingVersion: truncate(value.PricingVersion, 20),
 		NumSourcesUsed: nonNegative(value.NumSourcesUsed), NumServerSideToolsUsed: nonNegative(value.NumServerSideToolsUsed),
 		ContextInputTokens: nonNegative(value.ContextInputTokens), ContextOutputTokens: nonNegative(value.ContextOutputTokens), FirstTokenMS: normalizedFirstToken(value), DurationMS: nonNegative(value.DurationMS),
-		ErrorCode: truncate(value.ErrorCode, 100), AttemptCount: len(value.Attempts), CreatedAt: value.CreatedAt,
+		ErrorCode:          truncate(value.ErrorCode, 100),
+		RequestMethod:      truncate(value.RequestMethod, 16),
+		RequestPath:        truncate(value.RequestPath, 2048),
+		RequestHeadersJSON: truncate(requestHeadersJSON, 65536),
+		AttemptCount:       len(value.Attempts), CreatedAt: value.CreatedAt,
 	}
 	attempts := make([]requestAuditAttemptModel, 0, len(value.Attempts))
 	for _, attempt := range value.Attempts {
@@ -571,7 +596,7 @@ func (r *AuditRepository) List(ctx context.Context, offset, limit int) ([]audit.
 		return nil, 0, err
 	}
 	var rows []requestAuditModel
-	if err := query.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+	if err := query.Omit("request_headers_json").Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	out := make([]audit.Record, 0, len(rows))
@@ -627,7 +652,7 @@ func (r *AuditRepository) ListCursor(ctx context.Context, input repository.Audit
 	}
 	var rows []requestAuditModel
 	query = applyStableSort(query, input.Sort, fields, fallback, "request_audits.id")
-	if err := query.Limit(input.Limit + 1).Find(&rows).Error; err != nil {
+	if err := query.Omit("request_headers_json").Limit(input.Limit + 1).Find(&rows).Error; err != nil {
 		return nil, false, err
 	}
 	hasMore := len(rows) > input.Limit
@@ -693,6 +718,7 @@ type degradeTotalsRow struct {
 	Hard         int64   `gorm:"column:hard"`
 	Soft         int64   `gorm:"column:soft"`
 	Burst        int64   `gorm:"column:burst"`
+	Thinking     int64   `gorm:"column:thinking"`
 	MaxTPS       float64 `gorm:"column:max_tps"`
 }
 
@@ -705,10 +731,16 @@ type degradeAccountRow struct {
 	Burst              int64            `gorm:"column:burst"`
 	Soft               int64            `gorm:"column:soft"`
 	Hard               int64            `gorm:"column:hard"`
+	Thinking           int64            `gorm:"column:thinking"`
 	Last               degradeTimestamp `gorm:"column:last_seen"`
 	Enabled            bool             `gorm:"column:enabled"`
 	Found              bool             `gorm:"column:found"`
 	BuildBotFlagSource int              `gorm:"column:build_bot_flag_source"`
+}
+
+type degradeAccountLeaseRow struct {
+	AccountID     uint64           `gorm:"column:account_id"`
+	CooldownUntil degradeTimestamp `gorm:"column:cooldown_until"`
 }
 
 type degradeTimestamp time.Time
@@ -808,6 +840,7 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 				COALESCE(SUM(CASE WHEN d.degrade_class = 'hard_tps' THEN 1 ELSE 0 END), 0) AS hard,
 				COALESCE(SUM(CASE WHEN d.degrade_class = 'soft_tps' THEN 1 ELSE 0 END), 0) AS soft,
 				COALESCE(SUM(CASE WHEN d.degrade_class = 'buffered_burst' THEN 1 ELSE 0 END), 0) AS burst,
+				COALESCE(SUM(CASE WHEN d.degrade_class = 'missing_thinking' THEN 1 ELSE 0 END), 0) AS thinking,
 				COALESCE(MAX(d.tps), 0) AS max_tps`).
 			Joins("LEFT JOIN provider_accounts p ON p.id = d.account_id").
 			Scan(&totals).Error; err != nil {
@@ -816,7 +849,7 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 		result.Totals = repository.DegradeTotals{
 			Hits: totals.Hits, Accounts: totals.Accounts, StillEnabled: totals.StillEnabled,
 			Disabled: totals.Disabled, Deleted: totals.Deleted, Hard: totals.Hard, Soft: totals.Soft,
-			Burst: totals.Burst, MaxTPS: totals.MaxTPS,
+			Burst: totals.Burst, Thinking: totals.Thinking, MaxTPS: totals.MaxTPS,
 		}
 
 		accountQuery := r.degradeAccountAggregate(tx, classified, input)
@@ -839,13 +872,27 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 		for _, row := range accountRows {
 			result.Accounts = append(result.Accounts, repository.DegradeAccount{
 				ID: row.ID, Name: row.Name, Email: row.Email, Hits: row.Hits, MaxTPS: row.MaxTPS,
-				Burst: row.Burst, Soft: row.Soft, Hard: row.Hard, Last: time.Time(row.Last), Enabled: row.Enabled,
+				Burst: row.Burst, Soft: row.Soft, Hard: row.Hard, Thinking: row.Thinking, Last: time.Time(row.Last), Enabled: row.Enabled,
 				Found: row.Found, BuildBotFlagSource: row.BuildBotFlagSource,
 			})
 			accountIDs = append(accountIDs, row.ID)
 			accountsByID[row.ID] = &result.Accounts[len(result.Accounts)-1]
 		}
 		if len(accountIDs) > 0 {
+			var leaseRows []degradeAccountLeaseRow
+			if err := tx.Table("account_egress_lease_blocks").
+				Select("account_id, MAX(cooldown_until) AS cooldown_until").
+				Where("account_id IN ? AND cooldown_until > ?", accountIDs, input.End).
+				Group("account_id").Scan(&leaseRows).Error; err != nil {
+				return err
+			}
+			for _, row := range leaseRows {
+				if account := accountsByID[row.AccountID]; account != nil {
+					cooldownUntil := time.Time(row.CooldownUntil).UTC()
+					account.LeaseCooldownUntil = &cooldownUntil
+				}
+			}
+
 			var nodeRows []degradeAccountNodeRow
 			if err := tx.Table("(?) AS d", classified).
 				Select("d.account_id, COALESCE(NULLIF(d.egress_node_name, ''), '?') AS name").
@@ -877,7 +924,7 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 			bucketed := tx.Table("(?) AS d", classified).Select(caseSQL+" AS bucket_index, d.degrade_class", caseArgs...)
 			var bucketRows []degradeBucketRow
 			if err := tx.Table("(?) AS b", bucketed).
-				Select("b.bucket_index, COUNT(*) AS count, COALESCE(SUM(CASE WHEN b.degrade_class IN ('hard_tps', 'buffered_burst') THEN 1 ELSE 0 END), 0) AS severe").
+				Select("b.bucket_index, COUNT(*) AS count, COALESCE(SUM(CASE WHEN b.degrade_class IN ('hard_tps', 'buffered_burst', 'missing_thinking') THEN 1 ELSE 0 END), 0) AS severe").
 				Where("b.bucket_index >= 0").Group("b.bucket_index").Order("b.bucket_index ASC").Scan(&bucketRows).Error; err != nil {
 				return err
 			}
@@ -911,18 +958,26 @@ func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.D
 	if r.db.dialect == "postgres" {
 		castType = "DOUBLE PRECISION"
 	}
-	generationExpression := "(a.duration_ms - a.first_token_ms)"
+	generationExpression := fmt.Sprintf("(CASE WHEN a.reasoning_tokens > 0 AND a.duration_ms - a.first_token_ms < a.first_token_ms AND a.duration_ms - a.first_token_ms < %d THEN a.duration_ms ELSE a.duration_ms - a.first_token_ms END)", audit.DefaultDegradeMinGenMS)
 	// NULLIF keeps PostgreSQL safe even if its planner evaluates the throughput
 	// expression before the duration guard in the WHERE clause.
 	tpsExpression := fmt.Sprintf("(CAST(a.output_tokens AS %s) * 1000.0 / NULLIF(%s, 0))", castType, generationExpression)
-	classExpression := fmt.Sprintf("CASE WHEN ? AND %s < ? THEN ? WHEN %s >= ? THEN ? ELSE ? END", generationExpression, tpsExpression)
+	selectTPS := fmt.Sprintf("CASE WHEN a.error_code = ? THEN 0 ELSE %s END", tpsExpression)
+	classExpression := fmt.Sprintf("CASE WHEN a.error_code = ? THEN ? WHEN ? AND %s < ? THEN ? WHEN %s >= ? THEN ? ELSE ? END", generationExpression, tpsExpression)
+	speedPredicate := fmt.Sprintf(
+		"a.streaming = ? AND %s AND a.output_tokens >= ? AND a.first_token_ms IS NOT NULL AND a.duration_ms > a.first_token_ms AND %s >= ?",
+		auditSuccessPredicate, tpsExpression,
+	)
+	thinkingPredicate := "a.streaming = ? AND a.error_code = ? AND a.status_code >= 200 AND a.status_code < 300"
 	query := tx.Table("request_audits AS a").
-		Select("a.id, a.request_id, a.account_id, a.account_name, a.egress_node_id, a.egress_node_name, a.output_tokens, a.created_at, a.model_upstream_model, "+tpsExpression+" AS tps, "+classExpression+" AS degrade_class",
-			input.FailClosed, input.MinGenerationMS, audit.DegradeClassBurst, input.HardTPS, audit.DegradeClassHard, audit.DegradeClassSoft).
-		Where("a.provider = ?", "grok_build").Where("a.streaming = ?", true).
-		Where(auditSuccessPredicate).Where("a.output_tokens >= ?", input.MinOutputTokens).
-		Where("a.first_token_ms IS NOT NULL").Where("a.duration_ms > a.first_token_ms").
-		Where("a.request_id NOT LIKE ?", "quality_%").Where(tpsExpression+" >= ?", input.SoftTPS)
+		Select("a.id, a.request_id, a.account_id, a.account_name, a.egress_node_id, a.egress_node_name, a.output_tokens, a.created_at, a.model_upstream_model, "+selectTPS+" AS tps, "+classExpression+" AS degrade_class",
+			audit.ErrorQualityDegraded,
+			audit.ErrorQualityDegraded, audit.DegradeClassThinking, input.FailClosed, input.MinGenerationMS, audit.DegradeClassBurst, input.HardTPS, audit.DegradeClassHard, audit.DegradeClassSoft).
+		Where("a.provider = ?", "grok_build").
+		Where("a.request_id NOT LIKE ?", "quality_%").
+		Where("(("+speedPredicate+") OR ("+thinkingPredicate+"))",
+			true, input.MinOutputTokens, input.SoftTPS,
+			true, audit.ErrorQualityDegraded)
 	if !input.Start.IsZero() {
 		query = query.Where("a.created_at >= ?", input.Start)
 	}
@@ -942,6 +997,7 @@ func (r *AuditRepository) degradeAccountAggregate(tx *gorm.DB, classified *gorm.
 			COALESCE(SUM(CASE WHEN d.degrade_class = 'buffered_burst' THEN 1 ELSE 0 END), 0) AS burst,
 			COALESCE(SUM(CASE WHEN d.degrade_class = 'soft_tps' THEN 1 ELSE 0 END), 0) AS soft,
 			COALESCE(SUM(CASE WHEN d.degrade_class = 'hard_tps' THEN 1 ELSE 0 END), 0) AS hard,
+			COALESCE(SUM(CASE WHEN d.degrade_class = 'missing_thinking' THEN 1 ELSE 0 END), 0) AS thinking,
 			MAX(d.created_at) AS last_seen,
 			COALESCE(p.enabled, FALSE) AS enabled,
 			CASE WHEN p.id IS NULL THEN FALSE ELSE TRUE END AS found,
@@ -990,7 +1046,7 @@ func degradeBucketCase(buckets []repository.DegradeBucketRange) (string, []any) 
 func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter repository.AuditListFilter) *gorm.DB {
 	if value := strings.TrimSpace(search); value != "" {
 		pattern := "%" + strings.ToLower(value) + "%"
-		query = query.Where("LOWER(request_id) LIKE ? OR LOWER(model_public_id) LIKE ? OR LOWER(model_upstream_model) LIKE ? OR LOWER(egress_node_name) LIKE ?", pattern, pattern, pattern, pattern)
+		query = query.Where("LOWER(request_id) LIKE ? OR LOWER(model_public_id) LIKE ? OR LOWER(model_upstream_model) LIKE ? OR LOWER(client_ip) LIKE ? OR LOWER(egress_node_name) LIKE ?", pattern, pattern, pattern, pattern, pattern)
 	}
 	if !start.IsZero() {
 		query = query.Where("created_at >= ?", start)
@@ -1029,4 +1085,49 @@ func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter
 		query = query.Where("streaming = ?", false)
 	}
 	return query
+}
+
+func (r *AuditRepository) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	var totalDeleted int64
+	for {
+		var batchDeleted int64
+		var batchSelected int
+		err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var ids []uint64
+			if err := tx.Model(&requestAuditModel{}).
+				Select("id").
+				Where("created_at < ?", cutoff).
+				Order("id ASC").
+				Limit(auditPurgeBatchSize).
+				Pluck("id", &ids).Error; err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			batchSelected = len(ids)
+			if err := tx.Where("audit_id IN ?", ids).Delete(&requestAuditAttemptModel{}).Error; err != nil {
+				return err
+			}
+			res := tx.Where("id IN ? AND created_at < ?", ids, cutoff).Delete(&requestAuditModel{})
+			if res.Error != nil {
+				return res.Error
+			}
+			batchDeleted = res.RowsAffected
+			return nil
+		})
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += batchDeleted
+		// Use the number selected rather than RowsAffected to decide whether
+		// another batch may exist. In a multi-instance deployment another
+		// cleaner can delete part of this batch between selection and deletion.
+		if batchSelected < auditPurgeBatchSize {
+			return totalDeleted, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+	}
 }

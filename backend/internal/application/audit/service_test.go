@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -45,6 +47,61 @@ func TestServiceCloseFlushesQueuedAudits(t *testing.T) {
 	}
 	if total != 5 || len(values) != 5 {
 		t.Fatalf("total = %d, values = %d", total, len(values))
+	}
+}
+
+func TestCreateCapturesClientIPFromRequestContext(t *testing.T) {
+	repo := newGatedAuditRepository()
+	close(repo.release)
+	service := NewService(repo, slog.Default(), 8, 4, time.Hour)
+	service.Start()
+	t.Cleanup(func() { closeAuditService(t, service) })
+
+	ctx := requestmeta.WithClientIP(context.Background(), "2001:db8::10")
+	if err := service.Create(ctx, auditdomain.Record{EventID: "evt_client_ip_context", RequestID: "client-ip", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case values := <-repo.started:
+		if len(values) != 1 || values[0].ClientIP != "2001:db8::10" {
+			t.Fatalf("audit values = %#v", values)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("audit batch was not written")
+	}
+}
+
+func TestCreateKeepsOnlySanitizedRequestMetadata(t *testing.T) {
+	repo := newGatedAuditRepository()
+	close(repo.release)
+	service := NewService(repo, slog.Default(), 8, 1, time.Hour)
+	service.Start()
+	t.Cleanup(func() { closeAuditService(t, service) })
+
+	record := auditdomain.Record{
+		EventID: "evt_payload_policy_0001", RequestID: "payload-policy", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200,
+		RequestMethod: "POST", RequestPath: "/v1/responses?api_key=query-secret",
+		RequestHeaders: map[string][]string{
+			"Authorization":  {"Bearer client-secret"},
+			"X-Api-Key":      {"client-key"},
+			"X-Goog-Api-Key": {"google-key"},
+			"X-Session-ID":   {"session-secret"},
+			"User-Agent":     {"audit-test"},
+			"X-Oversized":    {strings.Repeat("x", requestHeaderValueLimit+100)},
+		},
+	}
+	if err := service.Create(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	stored := <-repo.started
+	if len(stored) != 1 || stored[0].RequestMethod != "POST" || stored[0].RequestPath != "/v1/responses" {
+		t.Fatalf("request metadata = %#v", stored)
+	}
+	if stored[0].RequestHeaders["Authorization"][0] != "[REDACTED]" || stored[0].RequestHeaders["X-Api-Key"][0] != "[REDACTED]" || stored[0].RequestHeaders["X-Goog-Api-Key"][0] != "[REDACTED]" || stored[0].RequestHeaders["X-Session-ID"][0] != "[REDACTED]" || stored[0].RequestHeaders["User-Agent"][0] != "audit-test" {
+		t.Fatalf("sanitized request headers = %#v", stored[0].RequestHeaders)
+	}
+	if len([]rune(stored[0].RequestHeaders["X-Oversized"][0])) != requestHeaderValueLimit {
+		t.Fatalf("oversized header was not bounded: %d", len([]rune(stored[0].RequestHeaders["X-Oversized"][0])))
 	}
 }
 

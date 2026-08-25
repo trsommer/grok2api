@@ -46,6 +46,17 @@ func TestVideoQuotaModeUsesWeb720pProduct(t *testing.T) {
 	}
 }
 
+func TestVideoQuotaFinalizationKeepsEffectiveConsumptionFence(t *testing.T) {
+	refreshMode, decrementMode, availabilityMode := quotaFinalizationModes(account.QuotaModeWebVideo720p, account.QuotaGroupWebImagine)
+	if refreshMode != account.QuotaGroupWebImagine || decrementMode != account.QuotaModeWebVideo720p || availabilityMode != "" {
+		t.Fatalf("refresh=%q decrement=%q availability=%q", refreshMode, decrementMode, availabilityMode)
+	}
+	refreshMode, decrementMode, availabilityMode = quotaFinalizationModes("weekly", account.QuotaGroupWebImagine)
+	if refreshMode != "weekly" || decrementMode != "weekly" || availabilityMode != account.QuotaGroupWebImagine {
+		t.Fatalf("shared weekly refresh=%q decrement=%q availability=%q", refreshMode, decrementMode, availabilityMode)
+	}
+}
+
 func TestGetVideoExposesOnlyReadableResultAsset(t *testing.T) {
 	completed := media.Job{
 		ID: "video_status", ClientKeyID: 7, Status: media.StatusCompleted,
@@ -165,14 +176,107 @@ func TestVideoPricingLeavesUnmeasurableOperationsUnpriced(t *testing.T) {
 	}
 }
 
+// 上游对 Console 视频的这两条限制原先只在 provider 层拦截，而生成接口是异步的，
+// 客户端会先拿到 request_id 再从轮询里读到失败任务。入队前校验让错误立刻可见。
+func TestVideoRouteParametersRejectConsoleReferenceLimits(t *testing.T) {
+	// 实测：8 张 reference_images 上游回 400 "Too many reference images: 8. Maximum allowed is 7."
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "720p", false, 8, 6); !errors.Is(err, ErrVideoParameterInvalid) {
+		t.Fatalf("8 references error = %v", err)
+	}
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "720p", false, 7, 6); err != nil {
+		t.Fatalf("7 references error = %v", err)
+	}
+	// 实测：grok-imagine-video 的 reference-to-video 回 400
+	// "Duration 15s exceeds the maximum allowed for reference-to-video, which is 10s."
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 15); !errors.Is(err, ErrVideoParameterInvalid) {
+		t.Fatalf("base model reference duration error = %v", err)
+	}
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 10); err != nil {
+		t.Fatalf("base model 10s reference error = %v", err)
+	}
+	// image-to-video（无 reference_images）与 1.5 都保持 15s。
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 15); err != nil {
+		t.Fatalf("base model text/first-frame 15s error = %v", err)
+	}
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "720p", false, 2, 15); err != nil {
+		t.Fatalf("1.5 multi-reference 15s error = %v", err)
+	}
+	// Build 使用相同的 1.5 上游模型名，但支持通用上限 8；不能因同名套用 Console 的 7 张限制。
+	if err := validateVideoRouteParameters(account.ProviderBuild, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "720p", false, 8, 15); err != nil {
+		t.Fatalf("Build 1.5 references error = %v", err)
+	}
+	// Web 新协议只有文本生视频抓包证据；不能退回已删除的 media-post 旧链路。
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 0, 15); err != nil {
+		t.Fatalf("Web text video error = %v", err)
+	}
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+		t.Fatalf("Web image video error = %v", err)
+	}
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+		t.Fatalf("Web reference video error = %v", err)
+	}
+}
+
+func TestRoutesForVideoParametersKeepsCompatibleSameNameProviders(t *testing.T) {
+	routes := []model.Route{
+		{ID: 1, PublicID: "shared-video", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-video-1.5"},
+		{ID: 2, PublicID: "shared-video", Provider: account.ProviderBuild, UpstreamModel: "grok-imagine-video-1.5"},
+	}
+	compatible, err := routesForVideoParameters(routes, provider.VideoOperationGenerate, "720p", false, 8, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compatible) != 1 || compatible[0].ID != 2 {
+		t.Fatalf("compatible routes = %#v", compatible)
+	}
+	if _, err := routesForVideoParameters(routes[:1], provider.VideoOperationGenerate, "720p", false, 8, 15); !errors.Is(err, ErrVideoParameterInvalid) {
+		t.Fatalf("Console-only invalid route error = %v", err)
+	}
+}
+
+func TestCreateVideoAppliesRouteConstraintsAfterKeyEligibilityAndBeforeInputIO(t *testing.T) {
+	routes := []model.Route{
+		{ID: 1, PublicID: "shared-video", Provider: account.ProviderBuild, UpstreamModel: "grok-imagine-video-1.5", Capability: model.CapabilityResponses},
+		{ID: 2, PublicID: "shared-video", Provider: account.ProviderBuild, UpstreamModel: "grok-imagine-video-1.5", Capability: model.CapabilityVideo},
+		{ID: 3, PublicID: "shared-video", Provider: account.ProviderConsole, UpstreamModel: "grok-imagine-video-1.5", Capability: model.CapabilityVideo},
+	}
+	jobs := &videoUsageRepository{}
+	assets := &videoAssetStoreStub{inputID: "unused", inputData: []byte("unused")}
+	service := &Service{
+		models:     &aliasRouteResolver{byPublic: map[string][]model.Route{"shared-video": routes}},
+		clientKeys: clientkeyapp.NewService(nil, nil, nil, 60, 4, nil),
+		providers:  provider.NewRegistry(consoleVideoAdmissionAdapter{}),
+		mediaJobs:  jobs, mediaAssets: assets, mediaQueue: make(chan string, 1), mediaQueued: make(map[string]struct{}),
+		logger: slog.Default(),
+	}
+	references := make([]string, provider.ConsoleVideoMaxReferenceImages+1)
+	for index := range references {
+		references[index] = VideoInputFileReference(fmt.Sprintf("unused_%d", index))
+	}
+	_, err := service.CreateVideo(context.Background(), VideoInput{
+		PublicModel: "shared-video", Prompt: "animate", Duration: 6, Resolution: "720p",
+		ReferenceURLs: references,
+		ClientKey: clientkey.Key{
+			ProviderScope: clientkey.ProviderScopeConsole,
+			AllowedModels: []uint64{3},
+		},
+	})
+	if !errors.Is(err, ErrVideoParameterInvalid) {
+		t.Fatalf("CreateVideo error = %v", err)
+	}
+	if assets.openInputCalls != 0 || jobs.createCalls != 0 || len(service.mediaQueue) != 0 || len(service.mediaQueued) != 0 {
+		t.Fatalf("side effects: input opens=%d job creates=%d queue=%d queued-set=%d", assets.openInputCalls, jobs.createCalls, len(service.mediaQueue), len(service.mediaQueued))
+	}
+}
+
 func TestVideo1080pValidationUsesResolvedUpstreamModel(t *testing.T) {
-	if err := validateVideoRouteParameters(provider.VideoOperationGenerate, "grok-imagine-video-1.5", "1080P", false); err != nil {
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "1080P", false, 0, 6); err != nil {
 		t.Fatalf("1.5 text/image 1080p rejected: %v", err)
 	}
-	if err := validateVideoRouteParameters(provider.VideoOperationGenerate, "grok-imagine-video", "1080p", false); !errors.Is(err, ErrVideoOperationUnsupported) {
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video", "1080p", false, 0, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
 		t.Fatalf("legacy 1080p error = %v", err)
 	}
-	if err := validateVideoRouteParameters(provider.VideoOperationGenerate, "grok-imagine-video-1.5", "1080p", true); !errors.Is(err, ErrVideoOperationUnsupported) {
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "1080p", false, 1, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
 		t.Fatalf("reference 1080p error = %v", err)
 	}
 }
@@ -268,7 +372,7 @@ func TestRecoverVideoJobsRecordsFailedAuditWithEgress(t *testing.T) {
 	nodeID := uint64(42)
 	repository := &videoUsageRepository{job: media.Job{
 		ID: "video_failed_recovery", RequestID: "request-failed-recovery",
-		ClientKeyID: 1, ClientKeyName: "client", AccountID: 2, AccountName: "account",
+		ClientKeyID: 1, ClientKeyName: "client", ClientIP: "203.0.113.9", AccountID: 2, AccountName: "account",
 		Provider: "grok_web", Model: "grok-imagine-video", ModelRouteID: 3, UpstreamModel: "video",
 		Seconds: 8, Quality: "720p", Status: media.StatusFailed, ErrorCode: "generation_failed", ErrorMessage: "upstream disconnected",
 		EgressNodeID: &nodeID, EgressNodeName: "warp", EgressScope: "grok_web", EgressMode: "proxy",
@@ -282,7 +386,7 @@ func TestRecoverVideoJobsRecordsFailedAuditWithEgress(t *testing.T) {
 	if repository.job.UsageRecordedAt == nil || recorder.calls != 1 {
 		t.Fatalf("recordedAt = %v, audit calls = %d", repository.job.UsageRecordedAt, recorder.calls)
 	}
-	if recorder.last.StatusCode != 502 || recorder.last.ErrorCode != "generation_failed" || recorder.last.EgressNodeID == nil || *recorder.last.EgressNodeID != nodeID || recorder.last.EgressNodeName != "warp" || recorder.last.EgressMode != audit.EgressModeProxy {
+	if recorder.last.ClientIP != "203.0.113.9" || recorder.last.StatusCode != 502 || recorder.last.ErrorCode != "generation_failed" || recorder.last.EgressNodeID == nil || *recorder.last.EgressNodeID != nodeID || recorder.last.EgressNodeName != "warp" || recorder.last.EgressMode != audit.EgressModeProxy {
 		t.Fatalf("audit = %#v", recorder.last)
 	}
 	if recorder.last.EstimatedCostInUSDTicks != 0 || recorder.last.MediaOutputSeconds != 0 {
@@ -443,6 +547,14 @@ type videoPersistAdapter struct {
 	lastCredentialID uint64
 }
 
+type consoleVideoAdmissionAdapter struct{}
+
+func (consoleVideoAdmissionAdapter) Provider() account.Provider { return account.ProviderConsole }
+
+func (consoleVideoAdmissionAdapter) GenerateVideo(context.Context, provider.VideoRequest) (provider.VideoResult, error) {
+	return provider.VideoResult{}, errors.New("unexpected Console video generation")
+}
+
 func (a *videoPersistAdapter) Provider() account.Provider { return account.ProviderWeb }
 
 func (a *videoPersistAdapter) GenerateVideo(context.Context, provider.VideoRequest) (provider.VideoResult, error) {
@@ -460,15 +572,16 @@ func (a *videoPersistAdapter) DownloadVideo(_ context.Context, credential accoun
 }
 
 type videoAssetStoreStub struct {
-	saveCalls int
-	openAsset media.Asset
-	openData  []byte
-	openErr   error
-	inputID   string
-	inputData []byte
-	inputSize int64
-	inputKind string
-	inputMIME string
+	saveCalls      int
+	openInputCalls int
+	openAsset      media.Asset
+	openData       []byte
+	openErr        error
+	inputID        string
+	inputData      []byte
+	inputSize      int64
+	inputKind      string
+	inputMIME      string
 }
 
 func (s *videoAssetStoreStub) SaveVideo(_ context.Context, jobID, contentType string, body io.Reader) (media.Asset, error) {
@@ -497,6 +610,7 @@ func (s *videoAssetStoreStub) OpenVideo(_ context.Context, id string) (media.Ass
 }
 
 func (s *videoAssetStoreStub) OpenInputAsset(_ context.Context, id string) (media.Asset, io.ReadCloser, error) {
+	s.openInputCalls++
 	if id != s.inputID || len(s.inputData) == 0 {
 		return media.Asset{}, nil, errors.New("not implemented")
 	}
@@ -534,9 +648,16 @@ func (r *durableVideoAuditRecorder) CreateDurable(_ context.Context, value audit
 	return nil
 }
 
-type videoUsageRepository struct{ job media.Job }
+type videoUsageRepository struct {
+	job         media.Job
+	createCalls int
+}
 
-func (r *videoUsageRepository) CreateMediaJob(context.Context, media.Job) error { return nil }
+func (r *videoUsageRepository) CreateMediaJob(_ context.Context, value media.Job) error {
+	r.createCalls++
+	r.job = value
+	return nil
+}
 
 func (r *videoUsageRepository) GetMediaJob(context.Context, string, uint64) (media.Job, error) {
 	return r.job, nil

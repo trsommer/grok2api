@@ -61,7 +61,7 @@ func TestAuditRepositoryBatchAndCursor(t *testing.T) {
 		{RequestID: "cursor-old", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, CreatedAt: now.Add(-48 * time.Hour)},
 		{RequestID: "cursor-1", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, CreatedAt: now.Add(-3 * time.Minute)},
 		{RequestID: "cursor-2", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, CreatedAt: now.Add(-2 * time.Minute)},
-		{RequestID: "cursor-3", ClientKeyID: 1, ClientKeyName: "production", ModelRouteID: 1, ModelPublicID: "grok-test", ModelUpstreamModel: "grok-test-upstream", AccountName: "primary", EgressNodeID: uint64Pointer(42), EgressNodeName: "proxy-shanghai", EgressScope: "grok_web", EgressMode: audit.EgressModeProxy, StatusCode: 200, CreatedAt: now.Add(-time.Minute)},
+		{RequestID: "cursor-3", ClientKeyID: 1, ClientKeyName: "production", ClientIP: "203.0.113.42", ModelRouteID: 1, ModelPublicID: "grok-test", ModelUpstreamModel: "grok-test-upstream", ReasoningEffort: "xhigh", AccountName: "primary", EgressNodeID: uint64Pointer(42), EgressNodeName: "proxy-shanghai", EgressScope: "grok_web", EgressMode: audit.EgressModeProxy, StatusCode: 200, CreatedAt: now.Add(-time.Minute)},
 	}
 	if err := repository.CreateBatch(ctx, values); err != nil {
 		t.Fatal(err)
@@ -74,12 +74,16 @@ func TestAuditRepositoryBatchAndCursor(t *testing.T) {
 	if len(first) != 2 || !hasMore || first[0].ID <= first[1].ID {
 		t.Fatalf("first page = %#v, hasMore = %v", first, hasMore)
 	}
-	if first[0].ClientKeyName != "production" || first[0].ModelPublicID != "grok-test" || first[0].ModelUpstreamModel != "grok-test-upstream" || first[0].AccountName != "primary" || first[0].EgressNodeID == nil || *first[0].EgressNodeID != 42 || first[0].EgressNodeName != "proxy-shanghai" || first[0].EgressMode != audit.EgressModeProxy {
+	if first[0].ClientKeyName != "production" || first[0].ClientIP != "203.0.113.42" || first[0].ModelPublicID != "grok-test" || first[0].ModelUpstreamModel != "grok-test-upstream" || first[0].ReasoningEffort != "xhigh" || first[0].AccountName != "primary" || first[0].EgressNodeID == nil || *first[0].EgressNodeID != 42 || first[0].EgressNodeName != "proxy-shanghai" || first[0].EgressMode != audit.EgressModeProxy {
 		t.Fatalf("audit snapshots = %#v", first[0])
 	}
 	matched, _, err := repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Limit: 10, Search: "proxy-shanghai", Sort: sort})
 	if err != nil || len(matched) != 1 || matched[0].RequestID != "cursor-3" {
 		t.Fatalf("egress search = %#v, err = %v", matched, err)
+	}
+	matched, _, err = repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Limit: 10, Search: "203.0.113.42", Sort: sort})
+	if err != nil || len(matched) != 1 || matched[0].RequestID != "cursor-3" {
+		t.Fatalf("client IP search = %#v, err = %v", matched, err)
 	}
 	second, _, err := repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Cursor: &repositorypkg.SortCursor{ID: first[len(first)-1].ID, Value: first[len(first)-1].CreatedAt}, Limit: 2, Sort: sort})
 	if err != nil {
@@ -445,15 +449,18 @@ func TestAuditRepositoryNormalizesUntrustedUsage(t *testing.T) {
 	}
 	repository := NewAuditRepository(database)
 	negativeFirstToken := int64(-4)
-	if err := repository.Create(ctx, audit.Record{RequestID: "normalize", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, Streaming: true, MediaInputImages: -1, MediaOutputImages: -2, MediaOutputSeconds: -3, InputTokens: -1, TotalTokens: -2, FirstTokenMS: &negativeFirstToken, DurationMS: -3, CreatedAt: time.Now().UTC()}); err != nil {
+	if err := repository.Create(ctx, audit.Record{RequestID: "normalize", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, Streaming: true, ReasoningEffort: "customer@example.com", MediaInputImages: -1, MediaOutputImages: -2, MediaOutputSeconds: -3, InputTokens: -1, TotalTokens: -2, FirstTokenMS: &negativeFirstToken, DurationMS: -3, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	values, _, err := repository.List(ctx, 0, 1)
 	if err != nil || len(values) != 1 {
 		t.Fatalf("values = %#v, err = %v", values, err)
 	}
-	if values[0].MediaInputImages != 0 || values[0].MediaOutputImages != 0 || values[0].MediaOutputSeconds != 0 || values[0].InputTokens != 0 || values[0].TotalTokens != 0 || values[0].FirstTokenMS == nil || *values[0].FirstTokenMS != 0 || values[0].DurationMS != 0 {
+	if values[0].ReasoningEffort != "" || values[0].MediaInputImages != 0 || values[0].MediaOutputImages != 0 || values[0].MediaOutputSeconds != 0 || values[0].InputTokens != 0 || values[0].TotalTokens != 0 || values[0].FirstTokenMS == nil || *values[0].FirstTokenMS != 0 || values[0].DurationMS != 0 {
 		t.Fatalf("normalized audit = %#v", values[0])
+	}
+	if err := repository.Create(ctx, audit.Record{RequestID: "invalid-ip", ClientKeyID: 1, ClientIP: "203.0.113.4 injected", ModelRouteID: 1, StatusCode: 200, CreatedAt: time.Now().UTC()}); err == nil {
+		t.Fatal("invalid client IP should be rejected")
 	}
 }
 
@@ -546,6 +553,106 @@ func TestDegradeTimestampScansPostgresTimeValue(t *testing.T) {
 	}
 	if actual := time.Time(value); !actual.Equal(expected) {
 		t.Fatalf("scanned timestamp = %s, want %s", actual, expected)
+	}
+}
+
+func TestAuditRepositoryRequestMetadata(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-request-body.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewAuditRepository(database)
+	now := time.Now().UTC()
+	reqHeaders := map[string][]string{
+		"User-Agent":   {"curl/8.4.0"},
+		"Content-Type": {"application/json"},
+	}
+	record := audit.Record{
+		RequestID:      "req-with-body",
+		ClientKeyID:    1,
+		ModelRouteID:   1,
+		StatusCode:     200,
+		RequestMethod:  "POST",
+		RequestPath:    "/v1/chat/completions",
+		RequestHeaders: reqHeaders,
+		CreatedAt:      now,
+	}
+	if err := repository.Create(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	items, _, err := repository.List(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1", len(items))
+	}
+	if len(items[0].RequestHeaders) != 0 {
+		t.Fatalf("list unexpectedly loaded audit payloads: %#v", items[0])
+	}
+	detail, err := repository.Get(ctx, items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.RequestMethod != "POST" || detail.RequestPath != "/v1/chat/completions" || detail.RequestHeaders["User-Agent"][0] != "curl/8.4.0" {
+		t.Fatalf("Detail HTTP fields mismatch: %#v", detail)
+	}
+}
+
+func TestAuditRepositoryPurgeOlderThanBatchesAuditsAndAttempts(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-purge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewAuditRepository(database)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	values := make([]audit.Record, auditPurgeBatchSize+1)
+	for index := range values {
+		values[index] = audit.Record{
+			EventID:      fmt.Sprintf("evt_audit_purge_%04d", index),
+			RequestID:    fmt.Sprintf("purge-%04d", index),
+			ClientKeyID:  1,
+			ModelRouteID: 1,
+			StatusCode:   200,
+			CreatedAt:    cutoff.Add(-time.Hour),
+			Attempts: []audit.Attempt{{
+				Number: 1, Source: audit.AttemptSourceCredential, Stage: "response_stream", StartedAt: cutoff.Add(-time.Hour),
+			}},
+		}
+	}
+	if err := repository.CreateBatch(ctx, values); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Create(ctx, audit.Record{
+		EventID: "evt_audit_purge_new", RequestID: "purge-new", ClientKeyID: 1, ModelRouteID: 1,
+		StatusCode: 200, CreatedAt: cutoff.Add(time.Hour),
+		Attempts: []audit.Attempt{{Number: 1, Source: audit.AttemptSourceCredential, Stage: "response", StartedAt: cutoff.Add(time.Hour)}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := repository.PurgeOlderThan(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != int64(len(values)) {
+		t.Fatalf("deleted = %d, want %d", deleted, len(values))
+	}
+	if count := tableRowCount(t, database, "request_audits"); count != 1 {
+		t.Fatalf("remaining audits = %d", count)
+	}
+	if count := tableRowCount(t, database, "request_audit_attempts"); count != 1 {
+		t.Fatalf("remaining attempts = %d", count)
 	}
 }
 

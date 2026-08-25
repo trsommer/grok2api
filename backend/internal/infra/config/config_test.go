@@ -214,6 +214,48 @@ qualityGuard:
 	if !value.QualityGuard.Enabled || value.QualityGuard.DeprecatedClientKeyID != 999 || value.QualityGuard.ActiveInterval.Value() != 45*time.Minute {
 		t.Fatalf("qualityGuard = %#v", value.QualityGuard)
 	}
+	retry := value.QualityGuard.RequestRetry
+	if retry.Enabled || retry.MaxAttempts != 6 || retry.HoldTimeout.Value() != 30*time.Second || retry.MinOutputTokens != 8 || retry.OnExhausted != "fail_closed" || retry.AccountCooldown.Value() != 12*time.Hour {
+		t.Fatalf("loaded requestRetry defaults = %#v", retry)
+	}
+}
+
+func TestDefaultQualityGuardRequestRetryContract(t *testing.T) {
+	t.Parallel()
+	got := defaultConfig().QualityGuard.RequestRetry
+	if got.Enabled || got.MaxAttempts != 6 || got.HoldTimeout.Value() != 30*time.Second || got.MinOutputTokens != 8 || got.OnExhausted != "fail_closed" || got.AccountCooldown.Value() != 12*time.Hour || got.IdleAccountCooldown.Value() != 15*time.Minute {
+		t.Fatalf("requestRetry defaults = %#v", got)
+	}
+}
+
+func TestQualityGuardRequestRetryAccountCooldownBounds(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		value   time.Duration
+		wantErr bool
+	}{
+		{name: "default", value: 0},
+		{name: "minimum", value: time.Minute},
+		{name: "maximum", value: 168 * time.Hour},
+		{name: "below minimum", value: time.Minute - time.Millisecond, wantErr: true},
+		{name: "above maximum", value: 168*time.Hour + time.Millisecond, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateQualityGuardRequestRetry(QualityGuardRequestRetryConfig{
+				Enabled: true, AccountCooldown: Duration(test.value),
+			})
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validate cooldown %s: err=%v, wantErr=%t", test.value, err, test.wantErr)
+			}
+			err = validateQualityGuardRequestRetry(QualityGuardRequestRetryConfig{
+				Enabled: true, IdleAccountCooldown: Duration(test.value),
+			})
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validate idle cooldown %s: err=%v, wantErr=%t", test.value, err, test.wantErr)
+			}
+		})
+	}
 }
 
 func TestEnabledQualityGuardUsesManagedIdentity(t *testing.T) {
@@ -239,13 +281,13 @@ func TestBuildResponseHeaderTimeoutIsRuntimeOnly(t *testing.T) {
 
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "0.2.119" {
+	if RecommendedBuildClientVersion != "1.0.4" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/0.2.119 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/1.0.4 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {
@@ -370,6 +412,66 @@ func TestRoutingMaxAttemptsSupportsLargeCredentialPools(t *testing.T) {
 	cfg.Routing.MaxAttempts = -2
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("values below unlimited sentinel should be rejected")
+	}
+}
+
+func TestValidateAuditRetentionDaysRange(t *testing.T) {
+	for _, days := range []int{-1, 366} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.Audit.RetentionDays = days
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("audit retentionDays %d should be rejected", days)
+		}
+	}
+	for _, days := range []int{0, 7, 365} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.Audit.RetentionDays = days
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("audit retentionDays %d should be valid: %v", days, err)
+		}
+	}
+}
+
+func TestValidateRejectsInvalidAutoAssignShareConfig(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Routing.AutoAssignMaxNodeShare = 0.03
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("autoAssignMaxNodeShare 0.03 should be rejected")
+	}
+	cfg = defaultConfig()
+	cfg.Routing.AutoAssignMaxMigrationShare = 1.5
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("autoAssignMaxMigrationShare 1.5 should be rejected")
+	}
+	if !validAutoAssignShare(0) || !validAutoAssignShare(0.3) || !validAutoAssignShare(1) {
+		t.Fatal("0, 0.3, and 1 must remain valid shares")
+	}
+}
+
+func TestValidateTrustedProxies(t *testing.T) {
+	for _, values := range [][]string{nil, {"127.0.0.1", "10.0.0.0/8", "2001:db8::/32"}} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.BootstrapAdmin.Password = "password123"
+		cfg.Server.TrustedProxies = values
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("trusted proxies %v: %v", values, err)
+		}
+	}
+	for _, value := range []string{"", " proxy.internal", "proxy.internal", "10.0.0.0/99", "0.0.0.0/0", "::/0"} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.BootstrapAdmin.Password = "password123"
+		cfg.Server.TrustedProxies = []string{value}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("trusted proxy %q should be rejected", value)
+		}
 	}
 }
 

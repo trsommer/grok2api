@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,6 +33,7 @@ type qualityProbeChatEvent struct {
 			Content          string `json:"content"`
 			Reasoning        string `json:"reasoning"`
 			ReasoningContent string `json:"reasoning_content"`
+			ThinkingContent  string `json:"thinking_content"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *struct {
@@ -76,7 +78,7 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	probeCtx := infraegress.WithQualityProbe(ctx)
 	result, err := s.CreateChatCompletion(probeCtx, Input{
 		RequestID: requestID, ClientKey: key, PublicModel: publicModel, Body: body,
-		Streaming: true, Operation: audit.OperationChat, ForcedEgressNodeID: nodeID,
+		Streaming: true, Operation: audit.OperationChat, ForcedEgressNodeID: nodeID, ForcedAccountID: input.AccountID,
 	})
 	if err != nil {
 		return egressapp.QualityProbeResult{}, normalizeQualityProbeRequestError(err)
@@ -108,6 +110,15 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 			return egressapp.QualityProbeResult{}, fmt.Errorf("质量探测响应超过 %d MiB", qualityProbeMaxStreamBytes>>20)
 		}
 		line = []byte(strings.TrimSpace(string(line)))
+		if bytes.Equal(line, []byte(": grok2api-reasoning-start")) {
+			if firstGeneratedAt.IsZero() {
+				firstGeneratedAt = time.Now()
+				if result.MarkFirstToken != nil {
+					result.MarkFirstToken()
+				}
+			}
+			continue
+		}
 		if !strings.HasPrefix(string(line), "data:") {
 			continue
 		}
@@ -124,6 +135,7 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 			responseID = event.ID
 		}
 		if event.Usage != nil {
+			usage.Reported = true
 			usage.InputTokens = event.Usage.PromptTokens
 			usage.OutputTokens = event.Usage.CompletionTokens
 			usage.ReasoningTokens = event.Usage.CompletionTokensDetails.ReasoningTokens
@@ -132,7 +144,7 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 		}
 		for _, choice := range event.Choices {
 			delta := choice.Delta
-			generated := delta.Content != "" || delta.Reasoning != "" || delta.ReasoningContent != ""
+			generated := qualityProbeHasGeneratedDelta(delta.Content, delta.Reasoning, delta.ReasoningContent, delta.ThinkingContent)
 			if generated && firstGeneratedAt.IsZero() {
 				firstGeneratedAt = time.Now()
 				if result.MarkFirstToken != nil {
@@ -169,14 +181,14 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	durationMS := completedAt.Sub(startedAt).Milliseconds()
 	var generationMS int64
 	if !firstGeneratedAt.IsZero() {
-		generationMS = durationMS - firstTokenMS
+		generationMS = audit.GenerationWindowMS(firstTokenMS, durationMS, usage.ReasoningTokens)
 		if generationMS < 1 {
 			generationMS = 1
 		}
 	}
 	var outputTokensPerSecond float64
 	if !firstGeneratedAt.IsZero() {
-		outputTokensPerSecond = qualityProbeOutputTokensPerSecond(usage.OutputTokens, durationMS, firstTokenMS)
+		outputTokensPerSecond = qualityProbeOutputTokensPerSecond(usage.OutputTokens, usage.ReasoningTokens, durationMS, firstTokenMS)
 	}
 	digest := sha256.Sum256([]byte(text))
 	return egressapp.QualityProbeResult{
@@ -199,10 +211,10 @@ func normalizeQualityProbeRequestError(err error) error {
 	return err
 }
 
-func qualityProbeOutputTokensPerSecond(outputTokens, durationMS, firstTokenMS int64) float64 {
-	generationMS := durationMS - firstTokenMS
-	if outputTokens <= 0 || generationMS <= 0 {
-		return 0
-	}
-	return float64(outputTokens) * 1000 / float64(generationMS)
+func qualityProbeOutputTokensPerSecond(outputTokens, reasoningTokens, durationMS, firstTokenMS int64) float64 {
+	return audit.OutputTokensPerSecond(outputTokens, reasoningTokens, firstTokenMS, durationMS)
+}
+
+func qualityProbeHasGeneratedDelta(content, reasoning, reasoningContent, thinkingContent string) bool {
+	return content != "" || reasoning != "" || reasoningContent != "" || thinkingContent != ""
 }
