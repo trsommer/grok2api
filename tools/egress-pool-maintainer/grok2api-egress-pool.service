@@ -1,0 +1,27 @@
+[Unit]
+Description=grok2api egress proxy pool maintainer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=debian
+Group=debian
+WorkingDirectory=/home/debian/grokAPI/grok2api/tools/egress-pool-maintainer
+Environment=GROK2API_ADMIN_URL=http://127.0.0.1:18000
+Environment=GROK2API_ADMIN_USER=admin
+Environment=GROK2API_ADMIN_PASS=8d2xrPfKeC-1cLSDiwK9W-qC
+Environment=GROK2API_SCOPE=grok_build
+Environment=GROK2API_POOL_DB=/home/debian/grokAPI/grok2api/tools/egress-pool-maintainer/egress-pool.db
+Environment=POOL_MAX_NODES=60
+Environment=POOL_VALIDATION_TARGETS=https://cli-chat-proxy.grok.com/v1/models,https://grok.com/robots.txt
+Environment=POOL_CONCURRENCY=40
+Environment=POOL_TIMEOUT=8
+Environment=POOL_REFRESH_EVERY=600
+Environment=POOL_SWEEP_EVERY=300
+ExecStart=/usr/bin/python3 /home/debian/grokAPI/grok2api/tools/egress-pool-maintainer/maintainer.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

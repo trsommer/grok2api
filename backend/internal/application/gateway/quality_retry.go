@@ -63,6 +63,15 @@ type QualityStreamSignals struct {
 	OutputTokens     int64
 	Terminal         bool
 	HoldExpired      bool
+	// SemanticOutput reports that the stream carried a structured tool call
+	// (or another non-text output item). A no-thinking mechanical tool call is
+	// healthy agentic behavior; only text-without-thinking is the degradation
+	// signature, so semantic turns must not be withheld on token counts alone.
+	SemanticOutput bool
+	// StreamedTextTokens counts only text observed directly on the stream,
+	// excluding the usage-derived VisibleTokens fallback. Tool-call arguments
+	// inflate usage.completion_tokens but are not chat text.
+	StreamedTextTokens int64
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -140,6 +149,17 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 		minOutput = defaultQualityMinOutput
 	}
 	if sig.HasThinking {
+		return QualityDeliver
+	}
+	// A structured tool call is the healthy shape of a mechanical agentic turn.
+	// Grok Build legitimately skips streamed reasoning before routine tool
+	// calls, and usage.completion_tokens counts the call arguments, so token
+	// counts cannot separate those turns from degraded ones. Withhold only
+	// text-without-thinking: that is the observed degradation signature (code
+	// and parameter markup dumped as chat text). If a no-thinking turn also
+	// carries substantial streamed plain text, it stays subject to the
+	// withhold below.
+	if sig.SemanticOutput && sig.StreamedTextTokens < minOutput {
 		return QualityDeliver
 	}
 	// Prefer observed/derived visible output. Total output includes reasoning
@@ -311,6 +331,13 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 	if qualityRequestHasReplayUnsafeHostedTools(input.Body) {
 		return false
 	}
+	// Tool-less utility prompts (session titles, summaries, one-shot Q&A)
+	// legitimately finish without streamed reasoning, and withholding them
+	// only burns accounts from rotation. Degradation protection targets
+	// agentic turns: requests that declare tools or continue a tool loop.
+	if !qualityRequestIsAgentic(input.Body) {
+		return false
+	}
 	// Aliases are rewritten before this gate, so inspect the effective request
 	// body instead of only the reasoning-capable base model. In particular,
 	// grok-4.3-none becomes grok-4.3 plus an explicit disabled setting.
@@ -321,6 +348,52 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 		return true
 	}
 	return modeldomain.SupportsReasoningForProvider(route.Provider, route.UpstreamModel)
+}
+
+// qualityRequestIsAgentic reports whether the request belongs to a tool-using
+// agent: it declares tools (any supported schema) or carries tool results /
+// tool calls in its input, i.e. it continues an existing tool loop.
+func qualityRequestIsAgentic(body []byte) bool {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return false
+	}
+	for _, key := range []string{"tools", "functions"} {
+		if raw, ok := payload[key]; ok && jsonRawArrayNonEmpty(raw) {
+			return true
+		}
+	}
+	if jsonRawArrayHasToolContinuation(payload["messages"]) || jsonRawArrayHasToolContinuation(payload["input"]) {
+		return true
+	}
+	return false
+}
+
+func jsonRawArrayNonEmpty(raw json.RawMessage) bool {
+	var arr []any
+	return json.Unmarshal(raw, &arr) == nil && len(arr) > 0
+}
+
+func jsonRawArrayHasToolContinuation(raw json.RawMessage) bool {
+	var arr []map[string]any
+	if json.Unmarshal(raw, &arr) != nil {
+		return false
+	}
+	for _, item := range arr {
+		switch jsonNodeString(item["type"]) {
+		case "function_call_output", "tool_result":
+			return true
+		case "function_call", "tool_use":
+			return true
+		}
+		if role, _ := item["role"].(string); strings.EqualFold(role, "tool") {
+			return true
+		}
+		if _, ok := item["tool_calls"]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {

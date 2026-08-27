@@ -31,6 +31,25 @@ type accountLease struct {
 	routingCandidate    *account.RoutingCandidate
 	selectorObservation *selectorLeaseObservation
 	release             func()
+	// sessionRelocated marks a continued conversation whose sticky account was
+	// lost (cooldown/quarantine/saturation) and had to fail over to a different
+	// account. The new account holds no reasoning-replay state for the session,
+	// so reusing the old upstream session identity degrades Grok Build into
+	// reasoning-less, malformed output; callers must start a fresh upstream
+	// session for this request.
+	sessionRelocated bool
+	// selectorRelocatedFrom records the account the conversation was previously
+	// sticky to when sessionRelocated is set.
+	selectorRelocatedFrom uint64
+}
+
+// RelocatedFrom reports the account the conversation was previously sticky to,
+// or 0 when this lease did not relocate mid-session.
+func (l *accountLease) RelocatedFrom() uint64 {
+	if l == nil || !l.sessionRelocated {
+		return 0
+	}
+	return l.selectorRelocatedFrom
 }
 
 const quotaProbeLease = 5 * time.Minute
@@ -455,6 +474,23 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	}
 	now := time.Now().UTC()
 	stickyKey := stickySessionKey(affinityKey)
+	// Capture the previously bound account before selection mutates the sticky
+	// store, so every exit path can detect a mid-session account relocation.
+	var stickyPriorAccount uint64
+	if stickyKey != "" {
+		if priorID, ok, getErr := s.sticky.Get(ctx, stickyKey, now); getErr == nil && ok {
+			stickyPriorAccount = priorID
+		}
+	}
+	defer func() {
+		if err != nil || lease == nil || stickyPriorAccount == 0 {
+			return
+		}
+		if lease.Credential.ID != stickyPriorAccount {
+			lease.sessionRelocated = true
+			lease.selectorRelocatedFrom = stickyPriorAccount
+		}
+	}()
 	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err

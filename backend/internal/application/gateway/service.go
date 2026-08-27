@@ -1049,7 +1049,20 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		promptCacheKey := input.PromptCacheKey
+		grokTurnIndex := input.GrokTurnIndex
+		if lease.sessionRelocated && promptCacheKey != "" {
+			// The conversation's sticky account was lost and this request landed on
+			// a different account that holds no reasoning-replay state for the
+			// session. Reusing the old session identity makes Grok Build continue
+			// without reasoning (observed as missing thinking, no-op edits, and
+			// raw parameter markup leaking into content), so start a fresh upstream
+			// session. The portable history travels inline with the request.
+			promptCacheKey = ""
+			grokTurnIndex = ""
+			s.logger.Warn("session_account_relocated_fresh_start", "request_id", input.RequestID, "model", route.UpstreamModel, "from_account", lease.RelocatedFrom(), "to_account", credential.ID)
+		}
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: promptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: grokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))

@@ -144,13 +144,21 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	// Usage.reasoning_tokens is not proof of thinking. 降智 accounts report
 	// hundreds of reasoning tokens on completed while the stream never sent
 	// reasoning_text / reasoning_summary deltas (TUI shows no thoughts).
+	// StreamedTextTokens excludes the usage-derived fallback used for
+	// VisibleTokens: it counts only text actually observed on the stream.
+	// Usage completion_tokens includes tool-call arguments and untrusted
+	// reasoning counts, so the semantic tool-call exemption in the classifier
+	// must not be defeated by it.
+	streamedText := int64((visibleRunes + 3) / 4)
 	return QualityStreamSignals{
-		HasThinking:      s.hasThinking,
-		ReasoningStarted: s.reasoningStarted || s.hasThinking,
-		VisibleTokens:    visible,
-		ReasoningTokens:  max(s.reasoningTokens, s.usage.ReasoningTokens),
-		OutputTokens:     output,
-		Terminal:         s.terminal,
+		HasThinking:        s.hasThinking,
+		ReasoningStarted:   s.reasoningStarted || s.hasThinking,
+		VisibleTokens:      visible,
+		ReasoningTokens:    max(s.reasoningTokens, s.usage.ReasoningTokens),
+		OutputTokens:       output,
+		Terminal:           s.terminal,
+		SemanticOutput:     s.semanticOutput,
+		StreamedTextTokens: streamedText,
 	}
 }
 

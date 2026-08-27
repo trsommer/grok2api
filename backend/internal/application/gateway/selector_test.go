@@ -476,6 +476,62 @@ func TestSelectorModelQuotaPreservesSessionAffinity(t *testing.T) {
 	}
 }
 
+func TestAcquireMarksSessionRelocationOnStickyFailover(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "sticky-relocation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	primary, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "primary", SourceKey: "relocate-primary", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "fallback", SourceKey: "relocate-fallback", EncryptedAccessToken: "encrypted-fallback",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 50, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sticky := memory.NewStickyStore()
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), sticky, nil, time.Hour, time.Second, time.Minute)
+
+	// First turn binds the session to the primary account.
+	lease, err := selector.AcquireForKey(ctx, account.ProviderBuild, 0, "grok-4.6", "", "reloc-session", nil, false, clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Credential.ID != primary.ID {
+		t.Fatalf("first acquire selected account %d, want primary %d", lease.Credential.ID, primary.ID)
+	}
+	if lease.RelocatedFrom() != 0 {
+		t.Fatalf("first acquire must not be marked relocated, got %d", lease.RelocatedFrom())
+	}
+	lease.Release()
+
+	// Primary goes unhealthy; the session must fail over and mark relocation.
+	selector.MarkModelQuotaExhausted(ctx, primary, nil, "grok-4.6", time.Hour)
+	lease, err = selector.AcquireForKey(ctx, account.ProviderBuild, 0, "grok-4.6", "", "reloc-session", nil, false, clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Credential.ID != fallback.ID {
+		t.Fatalf("failover acquire selected account %d, want fallback %d", lease.Credential.ID, fallback.ID)
+	}
+	if lease.RelocatedFrom() != primary.ID {
+		t.Fatalf("failover acquire relocated-from = %d, want primary %d", lease.RelocatedFrom(), primary.ID)
+	}
+	lease.Release()
+}
+
 func requireQuotaRecovery(t *testing.T, ctx context.Context, accounts repository.AccountRepository, accountID uint64) account.QuotaRecovery {
 	t.Helper()
 	recovery, err := accounts.GetQuotaRecovery(ctx, accountID)

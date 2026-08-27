@@ -256,6 +256,62 @@ func TestObserveQualityChunkNoThinkEnoughChat(t *testing.T) {
 	}
 }
 
+func TestObserveQualityChunkNoThinkToolCallChat(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolChat}
+	ObserveQualityChunk(&state, []byte(sse(
+		": grok2api-reasoning-start",
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"edit","arguments":"{\"filePath\":\"src/utils.js\",\"oldString\":\"a\",\"newString\":\"b\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: {"usage":{"completion_tokens":64,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)))
+	sig := state.signals()
+	if !sig.SemanticOutput || !sig.Terminal || sig.HasThinking || sig.StreamedTextTokens != 0 {
+		t.Fatalf("no-think tool-call fixture signals = %#v", sig)
+	}
+	if got := ClassifyQualityHold(sig, 8); got != QualityDeliver {
+		t.Fatalf("no-think tool call should deliver, got %s (%#v)", got, sig)
+	}
+}
+
+func TestObserveQualityChunkNoThinkToolCallPlusTextWithholds(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolChat}
+	content := strings.Repeat("word ", 40)
+	ObserveQualityChunk(&state, []byte(sse(
+		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"edit","arguments":"{}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: {"usage":{"completion_tokens":90,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)))
+	sig := state.signals()
+	if !sig.SemanticOutput || sig.VisibleTokens < 32 {
+		t.Fatalf("tool-call+text fixture signals = %#v", sig)
+	}
+	if got := ClassifyQualityHold(sig, 8); got != QualityWithhold {
+		t.Fatalf("text-dump with tool call should withhold, got %s (%#v)", got, sig)
+	}
+}
+
+func TestObserveQualityResponsesNoThinkFunctionCallDelivers(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolResponses}
+	ObserveQualityChunk(&state, []byte(sse(
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","name":"edit"}}`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"filePath\":\"x\"}"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.6","usage":{"output_tokens":48,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+	)))
+	sig := state.signals()
+	if !sig.SemanticOutput || !sig.Terminal || sig.HasThinking {
+		t.Fatalf("responses no-think function-call signals = %#v", sig)
+	}
+	if got := ClassifyQualityHold(sig, 8); got != QualityDeliver {
+		t.Fatalf("responses no-think function call should deliver, got %s (%#v)", got, sig)
+	}
+}
+
 func TestObserveQualityChunkShortNoThink(t *testing.T) {
 	t.Parallel()
 	state := qualityScanState{protocol: qualityProtocolChat}
@@ -956,7 +1012,7 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	t.Parallel()
 	cfg := QualityRetryRuntime{Enabled: true, MaxAttempts: 2, MinOutputTokens: 32}
 	route := modeldomain.Route{Provider: accountdomain.ProviderBuild, UpstreamModel: "grok-4.6", PublicID: "grok-4.6"}
-	input := Input{Streaming: true, PublicModel: "grok-4.6"}
+	input := Input{Streaming: true, PublicModel: "grok-4.6", Body: []byte(`{"model":"grok-4.6","stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`)}
 	if !shouldHoldQualityStream(input, nil, route, audit.OperationChat, cfg) {
 		t.Fatal("expected hold on thinking build chat")
 	}
@@ -1089,8 +1145,8 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	toolCache := input
 	toolCache.Body = []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
 	toolCache.AllowClientToolCacheRoute = true
-	if !shouldHoldQualityStream(toolCache, nil, route, audit.OperationChat, cfg) {
-		t.Fatal("client identity/cache compatibility alone must not disable the hold")
+	if shouldHoldQualityStream(toolCache, nil, route, audit.OperationChat, cfg) {
+		t.Fatal("client identity/cache compatibility alone must not enable the hold for a tool-less prompt")
 	}
 }
 
@@ -1163,7 +1219,7 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 
 	result, err := service.CreateChatCompletion(ctx, Input{
 		RequestID: "req-quality-hold", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true,
-		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true}`),
+		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`),
 	})
 	if err != nil {
 		t.Fatalf("attempt loop should deliver after withhold retry, err=%v", err)
@@ -1284,7 +1340,7 @@ func TestAttemptLoopQualityHoldFailOpenKeepsSingleAccountBody(t *testing.T) {
 
 	result, err := service.CreateChatCompletion(ctx, Input{
 		RequestID: "req-quality-single", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true,
-		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true}`),
+		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`),
 	})
 	if err != nil {
 		t.Fatalf("fail-open should deliver the only account body, err=%v", err)
@@ -1378,7 +1434,7 @@ func TestAttemptLoopQualityFailOpenFallbackAndTotalAttemptCap(t *testing.T) {
 
 	result, err := service.CreateChatCompletion(ctx, Input{
 		RequestID: "req-quality-fallback", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true,
-		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true}`),
+		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`),
 	})
 	if err != nil {
 		t.Fatalf("fail-open should return the retained response after later failures: %v", err)
@@ -1411,5 +1467,19 @@ func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})
 	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 8 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute {
 		t.Fatalf("defaults = %#v", got)
+	}
+}
+
+func TestShouldHoldQualityStreamSkipsToollessRequests(t *testing.T) {
+	t.Parallel()
+	cfg := QualityRetryRuntime{Enabled: true}
+	input := Input{Streaming: true, Body: []byte(`{"model":"grok-4.6","stream":true,"messages":[{"role":"user","content":"summarize"}]}`)}
+	route := modeldomain.Route{Provider: accountdomain.ProviderBuild, UpstreamModel: "grok-4.6"}
+	if shouldHoldQualityStream(input, nil, route, audit.OperationChat, cfg) {
+		t.Fatal("tool-less utility prompt must not be held")
+	}
+	input.Body = []byte(`{"model":"grok-4.6","stream":true,"messages":[{"role":"user","content":"edit files"}],"tools":[{"type":"function","function":{"name":"edit"}}]}`)
+	if !shouldHoldQualityStream(input, nil, route, audit.OperationChat, cfg) {
+		t.Fatal("agentic request with tools must be held")
 	}
 }
