@@ -13,7 +13,7 @@ Environment=GROK2API_ADMIN_USER=admin
 Environment=GROK2API_ADMIN_PASS=8d2xrPfKeC-1cLSDiwK9W-qC
 Environment=GROK2API_SCOPE=grok_build
 Environment=GROK2API_POOL_DB=/home/debian/grokAPI/grok2api/tools/egress-pool-maintainer/egress-pool.db
-Environment=POOL_MAX_NODES=60
+Environment=POOL_MAX_NODES=150
 Environment=POOL_VALIDATION_TARGETS=https://cli-chat-proxy.grok.com/v1/models,https://grok.com/robots.txt
 Environment=POOL_CONCURRENCY=40
 Environment=POOL_TIMEOUT=8
