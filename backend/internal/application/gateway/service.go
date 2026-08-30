@@ -228,6 +228,7 @@ type Service struct {
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	defaultReasoningEffort      atomic.Value // string; injected when agentic requests carry no explicit effort
 }
 
 type teamModelRateLimit struct {
@@ -484,6 +485,18 @@ func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) {
 // 默认 false：仅模型级冷却；true 时按旧逻辑将账号标为失效并出池。
 func (s *Service) UpdateMarkBuildChatDeniedAsReauth(enabled bool) {
 	s.markBuildChatDeniedAsReauth.Store(enabled)
+}
+
+// UpdateDefaultReasoningEffort 热更新代理请求的默认推理力度。空串表示保持上游
+// "auto" 思考模式不变。值会按目标模型支持度归一（xhigh/max 仅对显式支持
+// 的模型生效，其余回退 high）。
+func (s *Service) UpdateDefaultReasoningEffort(effort string) {
+	s.defaultReasoningEffort.Store(strings.ToLower(strings.TrimSpace(effort)))
+}
+
+func (s *Service) configuredDefaultReasoningEffort() string {
+	value, _ := s.defaultReasoningEffort.Load().(string)
+	return value
 }
 
 func (s *Service) UpdateRequestTimeout(value time.Duration) {
@@ -930,6 +943,17 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	input.PublicModel = publicModel
 	if aliasEffort != "" {
 		input.Body, err = rewriteAliasedModel(input.Body, publicModel, aliasEffort, operation)
+		if err != nil {
+			return nil, err
+		}
+	} else if effort := s.routeDefaultReasoningEffort(route); effort != "" &&
+		(operation == audit.OperationChat || operation == audit.OperationMessages || operation == audit.OperationResponses) &&
+		shouldApplyDefaultReasoningEffort(input.Body) {
+		// Grok's "auto" thinking has high variance on agentic traffic: it
+		// sometimes skips thinking entirely (lazy/withheld turns) and
+		// sometimes overthinks (10-20s+ first-token latency). An explicit
+		// effort pins deterministic thinking for tool-using requests.
+		input.Body, err = rewriteAliasedModel(input.Body, publicModel, effort, operation)
 		if err != nil {
 			return nil, err
 		}
@@ -1870,6 +1894,81 @@ func (s *Service) queueAccountModelSync(accountID uint64) {
 		}
 		logger.Info("model_etag_refresh_completed", "account_id", accountID, "models", count)
 	}()
+}
+
+// routeDefaultReasoningEffort returns the configured default effort when the
+// target route supports reasoning efforts, mapped to the highest level the
+// model supports (xhigh/max fall back to high for models without an xhigh
+// wire contract). Empty when no default is configured.
+func (s *Service) routeDefaultReasoningEffort(route modeldomain.Route) string {
+	effort := s.configuredDefaultReasoningEffort()
+	if effort == "" || effort == modeldomain.ReasoningEffortNone {
+		return ""
+	}
+	switch effort {
+	case modeldomain.ReasoningEffortLow, modeldomain.ReasoningEffortMedium, modeldomain.ReasoningEffortHigh, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortMax:
+	default:
+		return ""
+	}
+	if !modeldomain.SupportsReasoningForProvider(route.Provider, route.UpstreamModel) {
+		return ""
+	}
+	if modeldomain.SupportsReasoningEffortForProvider(route.Provider, route.PublicID, effort) {
+		return effort
+	}
+	// xhigh/max on a non-xhigh model: cap to the highest supported level
+	// instead of dropping the default entirely (matches alias behavior).
+	levels := modeldomain.SupportedReasoningEffortsForProvider(route.Provider, route.PublicID)
+	for _, candidate := range []string{modeldomain.ReasoningEffortHigh, modeldomain.ReasoningEffortMedium, modeldomain.ReasoningEffortLow} {
+		for _, supported := range levels {
+			if supported == candidate {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+// shouldApplyDefaultReasoningEffort reports whether the request is agentic
+// (declares tools or continues a tool loop) and carries no explicit effort
+// control. Utility prompts (titles, summaries) legitimately skip reasoning
+// and must keep upstream auto behavior.
+func shouldApplyDefaultReasoningEffort(body []byte) bool {
+	if !qualityRequestIsAgentic(body) {
+		return false
+	}
+	return !qualityRequestDisablesReasoning(body) && !requestCarriesExplicitEffort(body)
+}
+
+// requestCarriesExplicitEffort reports whether the body already carries an
+// effort control in any supported protocol shape.
+func requestCarriesExplicitEffort(body []byte) bool {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return false
+	}
+	if !isEmptyJSONRaw(payload["reasoning_effort"]) {
+		return true
+	}
+	for _, key := range []string{"reasoning", "output_config"} {
+		var nested map[string]json.RawMessage
+		if json.Unmarshal(payload[key], &nested) == nil && !isEmptyJSONRaw(nested["effort"]) {
+			return true
+		}
+	}
+	var thinking map[string]json.RawMessage
+	if json.Unmarshal(payload["thinking"], &thinking) == nil && (!isEmptyJSONRaw(thinking["type"]) || !isEmptyJSONRaw(thinking["budget_tokens"])) {
+		return true
+	}
+	return false
+}
+
+func isEmptyJSONRaw(raw json.RawMessage) bool {
+	if raw == nil {
+		return true
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed == "" || trimmed == "null"
 }
 
 func rewriteAliasedModel(body []byte, publicModel, reasoningEffort string, operation audit.Operation) ([]byte, error) {

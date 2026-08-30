@@ -229,6 +229,12 @@ type RoutingConfig struct {
 	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
+	// DefaultReasoningEffort optionally forces a reasoning effort (low/medium/high/xhigh)
+	// onto requests that declare tools but carry no explicit effort. Empty keeps
+	// upstream "auto" thinking. Grok's auto mode has high variance: it sometimes
+	// skips thinking entirely (lazy answers) and sometimes overthinks (15s+
+	// first-token latency). Pinning an explicit effort removes that variance.
+	DefaultReasoningEffort string `yaml:"defaultReasoningEffort"`
 	// AutoAssignMaxNodeShare optionally caps how many active accounts one
 	// healthy node may absorb during auto assignment. 0 keeps the historical
 	// unbounded first-pass evacuation. Values in [0.05, 1] are a fraction of
@@ -927,6 +933,7 @@ func defaultConfig() Config {
 			ReasoningReplayEnabled:      true,
 			ReasoningReplayTTL:          Duration(time.Hour),
 			ReasoningReplayMaxEntries:   10240,
+			DefaultReasoningEffort:     "",
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
