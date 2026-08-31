@@ -1205,9 +1205,12 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":40}}}`,
 		"data: [DONE]",
 	)
+	// Sticky-first quality retry: the first no-thinking withhold retries the
+	// SAME account before rotating. Account 2's second response thinks, so
+	// the request is delivered without ever touching account 3.
 	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
 		credentials[0].ID: {{status: http.StatusOK, body: ""}},
-		credentials[1].ID: {{status: http.StatusOK, body: noThink}},
+		credentials[1].ID: {{status: http.StatusOK, body: noThink}, {status: http.StatusOK, body: thinking}},
 		credentials[2].ID: {{status: http.StatusOK, body: thinking}},
 	}}
 	registry := provider.NewRegistry(adapter)
@@ -1237,8 +1240,8 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 		t.Fatal("first no-think body must not be delivered")
 	}
 	attempts := adapter.Attempts()
-	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
-		t.Fatalf("expected empty+no-think account exclusion and retry, attempts=%#v", attempts)
+	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[1].ID {
+		t.Fatalf("expected empty exclusion then sticky same-account retry, attempts=%#v", attempts)
 	}
 	emptyAccount, err := accountRepo.Get(ctx, credentials[0].ID)
 	if err != nil {
@@ -1254,11 +1257,9 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !noThinkingAccount.Enabled || noThinkingAccount.LastError != lastErrorMissingThinking || noThinkingAccount.CooldownUntil == nil {
-		t.Fatalf("missing-thinking account was not cooled: %#v", noThinkingAccount)
-	}
-	if remaining := time.Until(*noThinkingAccount.CooldownUntil); remaining < 11*time.Hour || remaining > 12*time.Hour+time.Minute {
-		t.Fatalf("missing-thinking cooldown = %s, want about 12h", remaining)
+	// First strike is sticky: the account must NOT be penalized or cooled.
+	if !noThinkingAccount.Enabled || noThinkingAccount.LastError == lastErrorMissingThinking || noThinkingAccount.CooldownUntil != nil {
+		t.Fatalf("first-strike sticky retry must not cool the account: %#v", noThinkingAccount)
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 20)
 	if err != nil {
@@ -1481,5 +1482,125 @@ func TestShouldHoldQualityStreamSkipsToollessRequests(t *testing.T) {
 	input.Body = []byte(`{"model":"grok-4.6","stream":true,"messages":[{"role":"user","content":"edit files"}],"tools":[{"type":"function","function":{"name":"edit"}}]}`)
 	if !shouldHoldQualityStream(input, nil, route, audit.OperationChat, cfg) {
 		t.Fatal("agentic request with tools must be held")
+	}
+}
+
+func TestAttemptLoopQualityRejectMemoryAndNoPenalty(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-reject-memory.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credentials := make([]accountdomain.Credential, 0, 3)
+	for index, name := range []string{"reject-a", "reject-b", "reject-c"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name, EncryptedAccessToken: name,
+			EncryptedRefreshToken: "refresh-" + name, ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "quality-reject-key", Prefix: "qreject", SecretHash: strings.Repeat("a", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every account always returns a no-thinking stream: a content-deterministic
+	// withhold storm. The ladder must fail closed without penalizing accounts.
+	noThink := func() string {
+		return sse(
+			`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+			`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+			"data: [DONE]",
+		)
+	}
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credentials[0].ID: {{status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}},
+		credentials[1].ID: {{status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}},
+		credentials[2].ID: {{status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, MaxAttempts: 3, MinOutputTokens: 32, OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second})
+
+	body := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`)
+	result, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-reject-1", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err == nil {
+		_ = result.Body.Close()
+		t.Fatal("fail-closed ladder must reject the request")
+	}
+	if result != nil && result.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("reject status = %d, want 503", result.StatusCode)
+	}
+	// First request: sticky retry on account 1, then rotate to account 2 (2
+	// quality attempts used of 3; third slot has no remaining routing attempt
+	// after the second withhold, so the ladder ends rejected).
+	firstAttempts := len(adapter.Attempts())
+	if firstAttempts == 0 {
+		t.Fatal("expected upstream attempts on first request")
+	}
+	// No account may be cooled or disabled by the fail-closed reject.
+	for _, credential := range credentials {
+		stored, getErr := accountRepo.Get(ctx, credential.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if !stored.Enabled || stored.CooldownUntil != nil || stored.LastError == lastErrorMissingThinking {
+			t.Fatalf("fail-closed reject must not penalize accounts: %#v", stored)
+		}
+	}
+
+	// Second request (client retry of the same conversation): the reject
+	// memory must collapse the ladder to a single attempt.
+	before := len(adapter.Attempts())
+	result2, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-reject-2", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err == nil {
+		_ = result2.Body.Close()
+		t.Fatal("suppressed retry must still fail closed")
+	}
+	secondAttempts := len(adapter.Attempts()) - before
+	if secondAttempts != 1 {
+		t.Fatalf("reject memory must collapse the retry ladder to 1 attempt, got %d", secondAttempts)
+	}
+	// Still no penalties.
+	for _, credential := range credentials {
+		stored, getErr := accountRepo.Get(ctx, credential.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if !stored.Enabled || stored.CooldownUntil != nil {
+			t.Fatalf("suppressed retry must not penalize accounts: %#v", stored)
+		}
 	}
 }

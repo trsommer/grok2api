@@ -513,6 +513,56 @@ func (s *Service) applyMissingThinkingPenalty(ctx context.Context, requestID str
 	}
 }
 
+// qualityRejectMemoryTTL bounds how long a fail-closed conversation reject
+// suppresses the full retry ladder for follow-up retries of the same
+// conversation. Client backoff loops typically retry within minutes; the
+// memory only needs to outlast one storm window.
+const qualityRejectMemoryTTL = 10 * time.Minute
+
+// rememberQualityReject records that a conversation's quality-retry ladder
+// ended in fail-closed rejection, so immediate client retries fail fast
+// instead of re-walking the account pool.
+func (s *Service) rememberQualityReject(conversationKey string) {
+	if conversationKey == "" {
+		return
+	}
+	now := time.Now()
+	s.qualityRejectMu.Lock()
+	defer s.qualityRejectMu.Unlock()
+	if len(s.qualityRejectRecent) >= 4096 {
+		for key, expiry := range s.qualityRejectRecent {
+			if expiry.Before(now) {
+				delete(s.qualityRejectRecent, key)
+			}
+		}
+		if len(s.qualityRejectRecent) >= 4096 {
+			s.qualityRejectRecent = make(map[string]time.Time)
+		}
+	}
+	s.qualityRejectRecent[conversationKey] = now.Add(qualityRejectMemoryTTL)
+}
+
+// qualityRejectLadderSuppressed reports whether this conversation was
+// fail-closed rejected recently. When true the request runs a single
+// quality attempt: no sticky retry, no account rotation, no cooldowns.
+func (s *Service) qualityRejectLadderSuppressed(conversationKey string) bool {
+	if conversationKey == "" {
+		return false
+	}
+	now := time.Now()
+	s.qualityRejectMu.Lock()
+	defer s.qualityRejectMu.Unlock()
+	expiry, ok := s.qualityRejectRecent[conversationKey]
+	if !ok {
+		return false
+	}
+	if expiry.Before(now) {
+		delete(s.qualityRejectRecent, conversationKey)
+		return false
+	}
+	return true
+}
+
 func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider) {
 	record := base
 	record.EventID = newAuditEventID()

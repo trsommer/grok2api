@@ -229,6 +229,12 @@ type Service struct {
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
 	defaultReasoningEffort      atomic.Value // string; injected when agentic requests carry no explicit effort
+	// qualityRejectMemory remembers conversations whose full quality-retry
+	// ladder ended in fail-closed rejection. Retries of the same conversation
+	// (client backoff loops) then fail fast on one attempt instead of
+	// re-walking the account pool and stacking cooldowns.
+	qualityRejectMu      sync.Mutex
+	qualityRejectRecent  map[string]time.Time
 }
 
 type teamModelRateLimit struct {
@@ -267,7 +273,7 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
-		modelSyncing: make(map[uint64]struct{}),
+		modelSyncing: make(map[uint64]struct{}), qualityRejectRecent: make(map[string]time.Time),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
@@ -1056,8 +1062,21 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
+	// qualityWithholdStrikes counts per-account no-thinking withholds within
+	// this request. The first strike retries the same account (sticky); the
+	// second strike penalizes and rotates.
+	qualityWithholdStrikes := make(map[uint64]int)
 	holdCfg := s.qualityRetryConfig()
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	// A conversation whose quality-retry ladder was fail-closed rejected
+	// moments ago gets a single quality attempt on client retries: the
+	// withhold is request-content-driven, so re-walking the pool only
+	// stacks cooldowns while the upstream window persists.
+	qualityLadderSuppressed := qualityHoldEnabled && s.qualityRejectLadderSuppressed(affinityKey)
+	if qualityLadderSuppressed {
+		holdCfg.MaxAttempts = 1
+		s.logger.Info("quality_reject_memory_hit", "request_id", input.RequestID)
+	}
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
@@ -1066,6 +1085,18 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	selection := preselectedSession
 	var lastErr error
 	var lastFailure *UpstreamFailure
+	// sessionStateReset is set when xAI rejected its server-side session
+	// state; the next forward must start a fresh upstream session (cleared
+	// prompt_cache_key / turn index / reasoning replay) while keeping the
+	// portable request history.
+	sessionStateReset := false
+	// pendingQualityPenalties collects per-account missing-thinking strikes
+	// during the ladder. In a content-deterministic withhold storm every
+	// account withholds regardless of health, so penalties are deferred:
+	// flushed only when a later attempt actually delivers thinking output
+	// (proving the earlier strikes were real account degradation), and
+	// dropped entirely when the ladder ends rejected.
+	pendingQualityPenalties := make([]accountdomain.Credential, 0, 2)
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	normalizedMetadata := &provider.NormalizedRequestMetadata{}
 	responseStartedAt := startedAt
@@ -1075,7 +1106,12 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		lease.markSelectorUpstreamStarted()
 		promptCacheKey := input.PromptCacheKey
 		grokTurnIndex := input.GrokTurnIndex
-		if lease.sessionRelocated && promptCacheKey != "" {
+		requestReplayKey := reasoningReplayKey
+		if sessionStateReset {
+			promptCacheKey = ""
+			grokTurnIndex = ""
+			requestReplayKey = ""
+		} else if lease.sessionRelocated && promptCacheKey != "" {
 			// The conversation's sticky account was lost and this request landed on
 			// a different account that holds no reasoning-replay state for the
 			// session. Reusing the old session identity makes Grok Build continue
@@ -1086,7 +1122,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			grokTurnIndex = ""
 			s.logger.Warn("session_account_relocated_fresh_start", "request_id", input.RequestID, "model", route.UpstreamModel, "from_account", lease.RelocatedFrom(), "to_account", credential.ID)
 		}
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: promptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: grokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: promptCacheKey, ReasoningReplayKey: requestReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: grokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
@@ -1488,6 +1524,27 @@ attemptLoop:
 		}
 		if isTerminalRequestForbidden(credential.Provider, lastFailure) {
 			// already prepared as a terminal 403 response for the client
+		} else if lastFailure != nil && lastFailure.SessionStateRejected {
+			// xAI rejected its own server-side session state (stale compaction
+			// blob / encrypted reasoning) while the portable request history is
+			// intact. The adapter-level recovery already tried stripping the
+			// opaque state once; when it could not complete (e.g. its retry hit
+			// a dead egress node), retry here with a FRESH session identity so
+			// the client never sees a 400 it would faithfully retry against
+			// the same stale session for hours.
+			body, _ := readRetryableBody(response.Body)
+			_ = body
+			lease.Release()
+			lastErr = fmt.Errorf("上游会话状态已失效")
+			s.logger.Warn("upstream_session_state_rejected_retry", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "model", route.UpstreamModel, "upstream_code", lastFailure.UpstreamCode)
+			// Force a fresh upstream session on the next attempt: same account
+			// is fine (the account is healthy), but the session identity and
+			// the reasoning replay keyed to it must be discarded.
+			sessionStateReset = true
+			if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+				break
+			}
+			continue
 		} else if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
@@ -1653,13 +1710,38 @@ attemptLoop:
 					}
 					continue
 				}
-				response.Body = replay
-				hasNextAccount := attemptPolicy.hasNext(attempt) && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
-				hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
-				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
-				if verdict == QualityWithhold {
-					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
-				}
+		response.Body = replay
+		hasNextAccount := attemptPolicy.hasNext(attempt) && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
+		hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
+		commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+		if verdict == QualityWithhold {
+			// Sticky-first quality retry: a no-thinking stream is usually a
+			// transient upstream/session condition (fresh session, proxy
+			// hiccup), not account degradation. Rotating accounts on the
+			// first strike destroys session stickiness — the observed root
+			// cause of mid-task reasoning loss and "lazy" completions on
+			// long chained tool sessions. Retry the SAME account first;
+			// penalize and rotate only on a repeated strike or when no
+			// further attempt is possible (fail-open delivery).
+			if commit.Action == QualityActionRetry && qualityWithholdStrikes[credential.ID] == 0 && selection != nil && !qualityLadderSuppressed {
+				qualityWithholdStrikes[credential.ID]++
+				delete(excluded, credential.ID)
+				selection.RetryAccount(credential.ID)
+				// Replaying byte-identical requests re-triggers a
+				// content-deterministic withhold. Start a fresh upstream
+				// session identity (same account, portable history) so the
+				// retry is not a pure replay.
+				sessionStateReset = true
+				s.logger.Info("quality_degraded_sticky_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+			} else if commit.Action == QualityActionRetry || commit.Action == QualityActionDeliverLast {
+				// Second strike (rotation) or fail-open delivery: defer the
+				// penalty. If a later attempt delivers real thinking, the
+				// strikes were genuine account degradation and the penalties
+				// flush; if the ladder ends rejected, they are dropped.
+				pendingQualityPenalties = append(pendingQualityPenalties, credential)
+				s.logger.Info("quality_degraded_penalty_deferred", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+			}
+		}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
 					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
@@ -1684,22 +1766,36 @@ attemptLoop:
 					}
 					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
 					continue
-				case QualityActionReject:
-					_ = response.Body.Close()
-					lease.Release()
-					lastErr = errQualityDegraded
-					lastFailure = &UpstreamFailure{
-						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
-						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
-						Cause: errQualityDegraded,
-					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
-					break attemptLoop
+			case QualityActionReject:
+				_ = response.Body.Close()
+				lease.Release()
+				lastErr = errQualityDegraded
+				lastFailure = &UpstreamFailure{
+					HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
+					PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
+					Cause: errQualityDegraded,
+				}
+				// Fail-closed reject never delivered degraded bytes to the
+				// client, and the withhold is request-content-driven, not
+				// account-driven. Penalizing here burns healthy accounts and
+				// fuels client-retry storms that walk the whole pool.
+				s.rememberQualityReject(affinityKey)
+				s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+				break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)
 					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
 				case QualityActionDeliver:
 					discardFallback(true)
+				}
+				// A delivered stream proves the ladder recovered. Earlier
+				// strikes were genuine account degradation: flush the
+				// deferred penalties now.
+				if len(pendingQualityPenalties) > 0 {
+					for _, penalized := range pendingQualityPenalties {
+						s.applyMissingThinkingPenalty(ctx, input.RequestID, penalized, holdCfg.AccountCooldown)
+					}
+					pendingQualityPenalties = pendingQualityPenalties[:0]
 				}
 				if !commit.KeepBody {
 					_ = response.Body.Close()
