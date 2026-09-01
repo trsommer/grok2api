@@ -61,6 +61,17 @@ CONFIG = {
     "max_import_latency_ms": int(os.getenv("POOL_MAX_IMPORT_LATENCY_MS", "2500")),
     # Cap per /24 subnet so one hijacked network block cannot dominate the pool.
     "max_per_subnet": int(os.getenv("POOL_MAX_PER_SUBNET", "4")),
+    # Exit-IP diversity: xAI's risk control sees the EXIT IP, not the proxy
+    # endpoint. Many "distinct" proxies multiplex onto a few exit IPs (observed:
+    # 400 nodes over 54 exits, worst IP carrying 77 accounts). Cap nodes per
+    # exit IP and per exit /24 so accounts spread across real addresses.
+    "max_per_exit_ip": int(os.getenv("POOL_MAX_PER_EXIT_IP", "2")),
+    "max_per_exit_subnet": int(os.getenv("POOL_MAX_PER_EXIT_SUBNET", "8")),
+    # Trim pass: max over-cap nodes disabled per sweep cycle, and a floor on
+    # enabled nodes (auto: max_nodes/2 when 0) so concentration trimming never
+    # shrinks the pool faster than diverse imports can replace it.
+    "trim_budget": int(os.getenv("POOL_TRIM_BUDGET", "10")),
+    "min_enabled_nodes": int(os.getenv("POOL_MIN_ENABLED_NODES", "0")),
 }
 
 # Quality sources, tried in order. Each entry: (name, url, kind)
@@ -179,9 +190,26 @@ def _http_reachable(targets, url, timeout):
     return False
 
 
+def _parse_exit_ip(body):
+    """Extract the exit IP from a Cloudflare trace body (ip=...) or an
+    ipinfo-style JSON body ({"ip": ...}). Returns None if not parseable."""
+    for line in body.splitlines():
+        if line.startswith("ip=") and line[3:].strip():
+            return line[3:].strip()
+    try:
+        data = json.loads(body)
+        ip = data.get("ip")
+        if ip:
+            return str(ip).strip()
+    except Exception:
+        pass
+    return None
+
+
 def _probe_exit_ip(url, timeout):
     """Mirror the gateway probe: fetch 1.1.1.1/cdn-cgi/trace through the
-    proxy; return latency_ms if 2xx and an ip= line parses, else None."""
+    proxy; return (latency_ms, exit_ip) if 2xx and an ip= line parses,
+    else None."""
     try:
         start = time.time()
         resp = http_get("https://1.1.1.1/cdn-cgi/trace", timeout=timeout, proxy=url)
@@ -189,17 +217,9 @@ def _probe_exit_ip(url, timeout):
         latency = int((time.time() - start) * 1000)
         if not (200 <= resp.status < 300):
             return None
-        for line in body.splitlines():
-            if line.startswith("ip=") and line[3:].strip():
-                return latency
-        # ipinfo.io-style JSON fallback
-        try:
-            import json as _json
-            data = _json.loads(body)
-            if data.get("ip"):
-                return latency
-        except Exception:
-            pass
+        exit_ip = _parse_exit_ip(body)
+        if exit_ip:
+            return (latency, exit_ip)
         return None
     except Exception:
         return None
@@ -218,22 +238,23 @@ def validate_proxy(candidate):
             status, body = socks5_fetch(candidate["host"], candidate["port"],
                                         "1.1.1.1", 443, "/cdn-cgi/trace", CONFIG["timeout"])
             if not (200 <= status < 300):
-                return dict(candidate, ok=False, latency_ms=None)
-            body_text = body.decode("utf-8", "replace")
-            if not any(line.startswith("ip=") and line[3:].strip() for line in body_text.splitlines()):
-                return dict(candidate, ok=False, latency_ms=None)
+                return dict(candidate, ok=False, latency_ms=None, exit_ip=None)
+            exit_ip = _parse_exit_ip(body.decode("utf-8", "replace"))
+            if not exit_ip:
+                return dict(candidate, ok=False, latency_ms=None, exit_ip=None)
             latency = int((time.time() - start) * 1000)
-            return dict(candidate, ok=True, latency_ms=latency)
+            return dict(candidate, ok=True, latency_ms=latency, exit_ip=exit_ip)
         except Exception:
-            return dict(candidate, ok=False, latency_ms=None)
+            return dict(candidate, ok=False, latency_ms=None, exit_ip=None)
     # HTTP(S): gateway-mirroring probe first (this is what decides node health)
-    probe_latency = _probe_exit_ip(url, CONFIG["timeout"])
-    if probe_latency is None:
-        return dict(candidate, ok=False, latency_ms=None)
+    probe = _probe_exit_ip(url, CONFIG["timeout"])
+    if probe is None:
+        return dict(candidate, ok=False, latency_ms=None, exit_ip=None)
+    probe_latency, exit_ip = probe
     # Then grok-target reachability (what the account traffic actually needs)
     if not _http_reachable(CONFIG["targets"], url, CONFIG["timeout"]):
-        return dict(candidate, ok=False, latency_ms=None)
-    return dict(candidate, ok=True, latency_ms=probe_latency)
+        return dict(candidate, ok=False, latency_ms=None, exit_ip=None)
+    return dict(candidate, ok=True, latency_ms=probe_latency, exit_ip=exit_ip)
 
 
 # ---------------------------------------------------------------------------
@@ -365,9 +386,28 @@ def subnet24(host):
     return host
 
 
-def rank_candidates(candidates, store):
+def exit_ip_census(nodes):
+    """Count enabled live nodes per exit IP and per exit /24. Nodes without a
+    known exit IP are ignored (they cannot be attributed)."""
+    ip_counts, subnet_counts = {}, {}
+    for n in nodes:
+        if not n.get("enabled"):
+            continue
+        ip = n.get("exitIp")
+        if not ip:
+            continue
+        ip_counts[ip] = ip_counts.get(ip, 0) + 1
+        sn = subnet24(ip)
+        subnet_counts[sn] = subnet_counts.get(sn, 0) + 1
+    return ip_counts, subnet_counts
+
+
+def rank_candidates(candidates, store, live_nodes=None):
     """Rank validated candidates: source uptime first, then measured latency.
-    Applies per-/24-subnet cap to avoid one network block dominating."""
+    Applies per-/24-subnet cap (proxy endpoint) and per-exit-IP / exit-/24
+    caps (what xAI risk control actually sees). Live-pool counts are seeded
+    into the exit caps so imports never stack onto already-concentrated
+    exits."""
     # Prefer proven proxies from our own DB history
     history = {row[0]: row[1] for row in store.history()}
     ranked = []
@@ -383,11 +423,24 @@ def rank_candidates(candidates, store):
         ranked.append((score, c))
     ranked.sort(key=lambda x: -x[0])
 
+    # Seed exit caps with the live pool's current concentration so the batch
+    # budget is spent on NEW exits, not on stacking more nodes onto old ones.
+    exit_ip_counts, exit_subnet_counts = exit_ip_census(live_nodes or [])
+
     selected, subnet_counts = [], {}
     for score, c in ranked:
         sn = subnet24(c["host"])
         if subnet_counts.get(sn, 0) >= CONFIG["max_per_subnet"]:
             continue
+        exit_ip = c.get("exit_ip")
+        if exit_ip:
+            if exit_ip_counts.get(exit_ip, 0) >= CONFIG["max_per_exit_ip"]:
+                continue
+            exit_sn = subnet24(exit_ip)
+            if exit_subnet_counts.get(exit_sn, 0) >= CONFIG["max_per_exit_subnet"]:
+                continue
+            exit_ip_counts[exit_ip] = exit_ip_counts.get(exit_ip, 0) + 1
+            exit_subnet_counts[exit_sn] = exit_subnet_counts.get(exit_sn, 0) + 1
         subnet_counts[sn] = subnet_counts.get(sn, 0) + 1
         selected.append(c)
     return selected
@@ -412,9 +465,16 @@ class PoolStore:
                 is_active INTEGER DEFAULT 1
             )
         """)
+        # Migration: record the exit IP observed at probe time. Hosts are not
+        # exit IPs (providers multiplex), so diversity must be enforced on the
+        # measured exit address, not the proxy endpoint.
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(proxies)")}
+        if "exit_ip" not in cols:
+            self.conn.execute("ALTER TABLE proxies ADD COLUMN exit_ip TEXT")
+            self.conn.commit()
         self.conn.commit()
 
-    def upsert_result(self, url, ok):
+    def upsert_result(self, url, ok, exit_ip=None):
         with self.lock:
             now = time.strftime("%Y-%m-%d %H:%M:%S")
             row = self.conn.execute(
@@ -430,14 +490,14 @@ class PoolStore:
                 last_ok = now if ok else None
                 self.conn.execute(
                     "UPDATE proxies SET success_count=?, failure_count=?, last_checked=?, "
-                    "last_ok=COALESCE(?, last_ok), is_active=1 WHERE url=?",
-                    (sc, fc, now, last_ok, url),
+                    "last_ok=COALESCE(?, last_ok), is_active=1, exit_ip=COALESCE(?, exit_ip) WHERE url=?",
+                    (sc, fc, now, last_ok, exit_ip, url),
                 )
             else:
                 self.conn.execute(
                     "INSERT INTO proxies (url, success_count, failure_count, last_checked, "
-                    "last_ok, is_active) VALUES (?, ?, ?, ?, ?, 1)",
-                    (url, 1 if ok else 0, 0 if ok else 1, now, now if ok else None),
+                    "last_ok, is_active, exit_ip) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                    (url, 1 if ok else 0, 0 if ok else 1, now, now if ok else None, exit_ip),
                 )
             self.conn.commit()
 
@@ -542,7 +602,8 @@ class GrokAdminClient:
         self.ensure_token()
         query = urllib.parse.quote(self.scope())
         # Explicit pageSize: the API default truncates large pools.
-        data = self._request("GET", f"/api/admin/v1/egress-nodes?scope={query}&pageSize=500")
+        # MaxPageSize=2000 server-side; keep headroom below the clamp.
+        data = self._request("GET", f"/api/admin/v1/egress-nodes?scope={query}&pageSize=2000")
         return data.get("data", {}).get("items", [])
 
     def scope(self):
@@ -582,6 +643,20 @@ class GrokAdminClient:
         except Exception as e:
             log(f"cleanup: {type(e).__name__}: {e}")
 
+    def rebalance(self):
+        """Ask the gateway to re-place accounts onto eligible nodes (moves
+        accounts off disabled/over-concentrated exits)."""
+        self.ensure_token()
+        try:
+            data = self._request("POST", "/api/admin/v1/egress-operations/rebalance")
+            value = data.get("data", {})
+            log(f"rebalance: {value.get('assigned', 0)} assigned, "
+                f"{value.get('rebalanced', 0)} rebalanced, {value.get('unplaced', 0)} unplaced")
+            return value
+        except Exception as e:
+            log(f"rebalance: {type(e).__name__}: {e}")
+            return {}
+
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -615,6 +690,63 @@ def sweep_nodes(client, store):
     client.purge_unhealthy()
 
 
+def deconcentrate_exit_ips(client, store):
+    """Gradually reduce exit-IP concentration in the live pool.
+
+    xAI risk control sees exit IPs, not proxy endpoints; many nodes multiplex
+    onto few exits (observed: 400 nodes over 43 exits, one IP carrying 55
+    nodes). Each cycle, disable up to trim_budget over-cap nodes —
+    zero-account nodes first — never letting enabled nodes fall below
+    min_enabled_nodes, then rebalance so accounts migrate off disabled exits.
+    Replacement imports are exit-capped, so the pool refills diverse.
+    """
+    nodes = client.list_nodes()
+    enabled = [n for n in nodes if n.get("enabled")]
+    floor = CONFIG["min_enabled_nodes"] or max(1, CONFIG["max_nodes"] // 2)
+    if len(enabled) <= floor:
+        return
+
+    by_exit = {}
+    for n in enabled:
+        ip = n.get("exitIp")
+        if ip:
+            by_exit.setdefault(ip, []).append(n)
+
+    # Over-cap exits: victims are zero-account nodes first, then fewest
+    # accounts; ties broken by worst health (keep the better nodes).
+    victims = []
+    for ip, group in by_exit.items():
+        excess = len(group) - CONFIG["max_per_exit_ip"]
+        if excess <= 0:
+            continue
+        group = sorted(group, key=lambda n: (n.get("assignedAccountCount") or 0,
+                                             -(n.get("health") or 0.0)))
+        victims.extend(group[:excess])
+    if not victims:
+        return
+
+    victims.sort(key=lambda n: (n.get("assignedAccountCount") or 0,
+                                -(n.get("health") or 0.0)))
+    allowed = min(CONFIG["trim_budget"], len(enabled) - floor)
+    victims = victims[:allowed]
+    if not victims:
+        return
+
+    ids = [n["id"] for n in victims]
+    exits = {n.get("exitIp") for n in victims}
+    accounts = sum(n.get("assignedAccountCount") or 0 for n in victims)
+    res = client.update_enabled(ids, False)
+    updated = res.get("updated", 0)
+    for n in victims:
+        name = n.get("name") or ""
+        if name:
+            store.deactivate([name])
+    log(f"deconcentrate: disabled {updated} node(s) across {len(exits)} over-cap exit(s) "
+        f"({accounts} account(s) to migrate), enabled {len(enabled) - updated}/{len(nodes)}")
+    if accounts:
+        client.rebalance()
+
+
 def discovery_cycle(client, store, healthy_count):
     """One discovery+validation+import cycle. Returns nothing."""
     raw = fetch_proxies()
@@ -641,7 +773,7 @@ def discovery_cycle(client, store, healthy_count):
         ok_proven = [r for r in results if r and r.get("ok")]
         for r in results:
             if r:
-                store.upsert_result(r["url"], bool(r.get("ok")))
+                store.upsert_result(r["url"], bool(r.get("ok")), r.get("exit_ip"))
         log(f"discovery: {len(ok_proven)}/{len(recheck)} proven proxies still alive")
 
     # Phase 2: validate fresh candidates not yet in the DB.
@@ -661,13 +793,15 @@ def discovery_cycle(client, store, healthy_count):
     ok = ok_proven + [r for r in results if r and r.get("ok")]
     fail = [r for r in results if r and not r.get("ok")]
     for r in fail:
-        store.upsert_result(r["url"], False)
+        store.upsert_result(r["url"], False, r.get("exit_ip"))
     log(f"discovery: {len(ok)} total validated "
         f"({len(ok_proven)} proven + {len(ok) - len(ok_proven)}/{len(candidates)} new)")
 
-    selected = rank_candidates(ok, store)
+    selected = rank_candidates(ok, store, live_nodes=client.list_nodes())
+    distinct_exits = len({c["exit_ip"] for c in selected if c.get("exit_ip")})
     log(f"discovery: {len(selected)} passed ranking "
-        f"(latency<={CONFIG['max_import_latency_ms']}ms, max {CONFIG['max_per_subnet']}/subnet)")
+        f"(latency<={CONFIG['max_import_latency_ms']}ms, max {CONFIG['max_per_subnet']}/subnet, "
+        f"max {CONFIG['max_per_exit_ip']}/exit-IP, {distinct_exits} distinct exits)")
 
     room = CONFIG["max_nodes"] - healthy_count
     if room > 0 and selected:
@@ -713,6 +847,7 @@ def main():
             if now - last_sweep >= CONFIG["sweep_every"]:
                 last_sweep = now
                 sweep_nodes(client, store)
+                deconcentrate_exit_ips(client, store)
 
         except Exception as e:
             log(f"error: {type(e).__name__}: {e}")
