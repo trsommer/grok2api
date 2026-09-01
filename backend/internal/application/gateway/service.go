@@ -1097,6 +1097,28 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// (proving the earlier strikes were real account degradation), and
 	// dropped entirely when the ladder ends rejected.
 	pendingQualityPenalties := make([]accountdomain.Credential, 0, 2)
+	// qualityEffortEscalation bumps the explicit reasoning effort on each
+	// quality retry. A withheld stream is often content-deterministic — the
+	// same bytes re-trigger it on any account — so retries must not be pure
+	// replays. Escalating effort (high → xhigh) changes the upstream
+	// generation path and breaks the determinism.
+	qualityEffortEscalation := 0
+	escalateQualityEffort := func() {
+		qualityEffortEscalation++
+		effort := ""
+		switch qualityEffortEscalation {
+		case 1:
+			effort = modeldomain.ReasoningEffortHigh
+		case 2:
+			effort = modeldomain.ReasoningEffortXHigh
+		default:
+			effort = modeldomain.ReasoningEffortXHigh
+		}
+		if rewritten, err := rewriteAliasedModel(input.Body, publicModel, effort, operation); err == nil {
+			input.Body = rewritten
+			s.logger.Info("quality_retry_effort_escalated", "request_id", input.RequestID, "effort", effort, "escalation", qualityEffortEscalation)
+		}
+	}
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	normalizedMetadata := &provider.NormalizedRequestMetadata{}
 	responseStartedAt := startedAt
@@ -1729,9 +1751,11 @@ attemptLoop:
 				selection.RetryAccount(credential.ID)
 				// Replaying byte-identical requests re-triggers a
 				// content-deterministic withhold. Start a fresh upstream
-				// session identity (same account, portable history) so the
-				// retry is not a pure replay.
+				// session identity (same account, portable history) and
+				// escalate the explicit reasoning effort so the retry is
+				// not a pure replay.
 				sessionStateReset = true
+				escalateQualityEffort()
 				s.logger.Info("quality_degraded_sticky_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
 			} else if commit.Action == QualityActionRetry || commit.Action == QualityActionDeliverLast {
 				// Second strike (rotation) or fail-open delivery: defer the
@@ -1739,6 +1763,9 @@ attemptLoop:
 				// strikes were genuine account degradation and the penalties
 				// flush; if the ladder ends rejected, they are dropped.
 				pendingQualityPenalties = append(pendingQualityPenalties, credential)
+				if commit.Action == QualityActionRetry {
+					escalateQualityEffort()
+				}
 				s.logger.Info("quality_degraded_penalty_deferred", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
 			}
 		}

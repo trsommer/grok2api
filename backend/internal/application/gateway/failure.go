@@ -37,10 +37,17 @@ type UpstreamFailure struct {
 	// as invalid arguments, content policy, or a ZDR-gated operation. Retrying the
 	// same request with another credential cannot fix it.
 	RequestScopedForbidden bool
-	CredentialRejected     bool
-	Fingerprint            string
-	RetryAfter             time.Duration
-	Cause                  error
+	// SessionStateRejected marks an upstream 400 that rejected server-side
+	// session state (stale compaction blob / undecryptable encrypted reasoning).
+	// The request itself is valid: retrying with a FRESH session identity
+	// (cleared prompt_cache_key and reasoning replay) succeeds. Without this,
+	// the 400 reaches the client, whose own retry reuses the same stale
+	// session identity and loops for hours.
+	SessionStateRejected bool
+	CredentialRejected   bool
+	Fingerprint          string
+	RetryAfter           time.Duration
+	Cause                error
 }
 
 func (e *UpstreamFailure) Error() string {
@@ -162,6 +169,19 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		failure.FreeQuotaExhausted = isFreeQuotaExhaustion(metadataText)
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
 		failure.QuotaExhausted = failure.FreeQuotaExhausted || isPaidQuotaExhaustion(metadataText)
+	case http.StatusBadRequest:
+		// xAI rejects stale server-side session state with a 400 while the
+		// request itself remains valid. The gateway adapter already strips the
+		// opaque reasoning and retries once; when that in-adapter recovery is
+		// exhausted (e.g. its retry hit a dead egress node), the request must
+		// still be retried here with a fresh session identity instead of
+		// surfacing the 400 to the client, whose retry would reuse the same
+		// stale session and loop.
+		if isSessionStateRejection(metadataText) || isSessionStateRejection(string(body)) {
+			failure.Code = "upstream_session_state_rejected"
+			failure.PublicMessage = "上游会话状态已失效，正在重置会话"
+			failure.SessionStateRejected = true
+		}
 	default:
 		failure.Code = "upstream_server_error"
 		failure.PublicMessage = "上游服务暂时异常"
@@ -203,6 +223,18 @@ func newCredentialUpstreamFailure(err error, accountID uint64, accountName strin
 
 func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
 	return provider.ExtractUpstreamErrorMetadata(body)
+}
+
+// isSessionStateRejection matches xAI's explicit stale-session 400 markers:
+// the upstream could not decode its own server-side state (compaction blob or
+// encrypted reasoning). The portable request history is intact, so a retry
+// with a fresh session identity is safe and expected to succeed.
+func isSessionStateRejection(text string) bool {
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "could not decode the compaction blob") ||
+		strings.Contains(text, "could not decrypt the provided encrypted_content")
 }
 
 func isAccountScopedForbidden(text string) bool {

@@ -33,11 +33,13 @@ func TestClassifyQualityHold(t *testing.T) {
 		want QualityVerdict
 	}{
 		{name: "thinking delivers", sig: QualityStreamSignals{HasThinking: true, VisibleTokens: 10}, want: QualityDeliver},
+		{name: "raw special tokens withhold", sig: QualityStreamSignals{VisibleTokens: 10, RawSpecialTokens: true}, want: QualityWithhold},
 		{name: "usage reasoning tokens alone withhold", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityWithhold},
 		{name: "visible 32 no think withhold", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityWithhold},
 		{name: "output 40 no think withhold", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
-		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityDeliver},
-		{name: "short no think delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
+		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityWithhold},
+		{name: "short no think terminal withholds in agentic holds", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityWithhold},
+		{name: "short no think with tool call delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true, SemanticOutput: true}, want: QualityDeliver},
 		{name: "empty terminal waits for transport handling", sig: QualityStreamSignals{Terminal: true}, want: QualityWait},
 		{name: "midstream enough content withhold", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWithhold},
 		{name: "stub midstream waits even with enough visible", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64}, want: QualityWait},
@@ -320,8 +322,10 @@ func TestObserveQualityChunkShortNoThink(t *testing.T) {
 		"data: [DONE]",
 	)))
 	sig := state.signals()
-	if ClassifyQualityHold(sig, 32) != QualityDeliver {
-		t.Fatalf("short no-think should deliver, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
+	// Agentic holds treat a short terminal no-think stream as the give-up
+	// signature: withhold so the ladder can retry with escalated effort.
+	if ClassifyQualityHold(sig, 32) != QualityWithhold {
+		t.Fatalf("short no-think terminal must withhold in agentic holds, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
 	}
 }
 
@@ -338,8 +342,25 @@ func TestObserveQualityChunkShortNoThinkIgnoresFakeReasoningUsage(t *testing.T) 
 	if sig.VisibleTokens >= 32 || sig.OutputTokens != 80 || sig.ReasoningTokens != 79 {
 		t.Fatalf("fake-usage short reply signals = %#v", sig)
 	}
-	if got := ClassifyQualityHold(sig, 32); got != QualityDeliver {
-		t.Fatalf("short visible reply must not be withheld by inflated usage: %s (%#v)", got, sig)
+	if got := ClassifyQualityHold(sig, 32); got != QualityWithhold {
+		t.Fatalf("short visible reply must not be delivered on inflated usage: %s (%#v)", got, sig)
+	}
+}
+
+func TestObserveQualityChunkRawSpecialTokenWithholds(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolChat}
+	ObserveQualityChunk(&state, []byte(sse(
+		`data: {"choices":[{"delta":{"content":"done fixing<|eos|>"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)))
+	sig := state.signals()
+	if !sig.RawSpecialTokens {
+		t.Fatalf("raw special token leak not detected: %#v", sig)
+	}
+	if got := ClassifyQualityHold(sig, 32); got != QualityWithhold {
+		t.Fatalf("raw special token leak must withhold, got %s", got)
 	}
 }
 
@@ -608,7 +629,8 @@ func TestPeekQualityStreamShortDelivers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	if verdict != QualityDeliver {
+	// Agentic holds treat short terminal no-think as the give-up signature.
+	if verdict != QualityWithhold {
 		t.Fatalf("short verdict=%s", verdict)
 	}
 }
@@ -985,8 +1007,9 @@ func TestPeekQualityStreamProcessesUnterminatedFinalEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	if verdict != QualityDeliver {
-		t.Fatalf("verdict = %s, want deliver for a real short response", verdict)
+	// Agentic holds treat short terminal no-think as the give-up signature.
+	if verdict != QualityWithhold {
+		t.Fatalf("verdict = %s, want withhold for a short no-think terminal response", verdict)
 	}
 }
 

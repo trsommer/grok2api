@@ -933,7 +933,75 @@ func (m *Manager) acquireUnavailableFallback(ctx context.Context, scope domain.S
 	if applied {
 		return lease, configured, nil
 	}
+	// The account's bound node is unavailable (disabled / cooling down / gone)
+	// and no explicit fallback mode is configured. Failing here strands every
+	// account bound to a dead node until an administrator intervenes — the
+	// observed failure mode is a mid-session transport error that aborts
+	// in-flight reasoning recovery and surfaces raw upstream 400s to clients.
+	// Instead, borrow any other healthy node in scope for this request. The
+	// account keeps its binding; the maintainer's rebalance will re-place it
+	// on a healthy node later.
+	if borrowed, borrowErr := m.acquireHealthyNodeInScope(ctx, scope, affinity, encryptedCredentialCookies, managedClearance); borrowErr == nil && borrowed != nil {
+		return borrowed, true, nil
+	}
 	return nil, true, primaryErr
+}
+
+// acquireHealthyNodeInScope selects any enabled, non-cooling node in the
+// scope's primary pool, ignoring the reserved fixed-fallback nodes.
+func (m *Manager) acquireHealthyNodeInScope(ctx context.Context, scope domain.Scope, affinity string, encryptedCredentialCookies string, managedClearance bool) (*Lease, error) {
+	now := time.Now().UTC()
+	config, supported, configErr := m.loadOperationsConfig(ctx, now)
+	if configErr != nil || !supported {
+		return nil, firstErr(configErr, fmt.Errorf("出口回退配置不可用"))
+	}
+	reservedFallbackNodes := make(map[uint64]struct{}, len(allEgressScopes()))
+	for _, fallbackScope := range allEgressScopes() {
+		configuredFallback := config.FallbackFor(fallbackScope)
+		if configuredFallback.Mode == domain.FallbackModeFixed && configuredFallback.NodeID != 0 {
+			reservedFallbackNodes[configuredFallback.NodeID] = struct{}{}
+		}
+	}
+	for _, candidateScope := range fallbackScopes(scope) {
+		nodes, err := m.listNodes(ctx, candidateScope, now)
+		if err != nil {
+			continue
+		}
+		available := make([]domain.Node, 0, len(nodes))
+		for _, node := range nodes {
+			if !node.Enabled {
+				continue
+			}
+			if _, reserved := reservedFallbackNodes[node.ID]; reserved {
+				continue
+			}
+			proxyPool := m.isProxyPoolNode(node)
+			if node.CooldownUntil != nil && now.Before(*node.CooldownUntil) && !proxyPool {
+				continue
+			}
+			available = append(available, node)
+		}
+		if len(available) == 0 {
+			continue
+		}
+		sort.SliceStable(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+		selected := m.selectNode(available, affinity)
+		lease, _, leaseErr := m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
+		if leaseErr != nil {
+			return nil, leaseErr
+		}
+		return lease, nil
+	}
+	return nil, fmt.Errorf("没有可借用的健康 %s 出口节点", scope)
+}
+
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // acquireFallback is called before an upstream request is written. Transport

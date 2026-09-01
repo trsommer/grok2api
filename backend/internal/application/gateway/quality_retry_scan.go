@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ type qualityScanState struct {
 	visibleRunes     int
 	aggregateRunes   int
 	semanticOutput   bool
+	rawSpecialTokens bool
 	reasoningTokens  int64
 	outputTokens     int64
 	usage            Usage
@@ -159,6 +161,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		Terminal:           s.terminal,
 		SemanticOutput:     s.semanticOutput,
 		StreamedTextTokens: streamedText,
+		RawSpecialTokens:   s.rawSpecialTokens,
 	}
 }
 
@@ -466,9 +469,25 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 	}
 }
 
+// qualityRawSpecialTokenPatterns matches raw model control tokens that must
+// never appear in visible output. Their presence is unambiguous upstream
+// degradation (tokenizer/template leakage from a 降智 stream).
+var qualityRawSpecialTokenPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`<\|[a-zA-Z_]+\|>`), // <|eos|>, <|end_of_turn|>, <|tool_call|> ...
+	regexp.MustCompile(`\[/?INST\]`),      // Mistral-style instruction markers
+}
+
 func noteVisibleContent(state *qualityScanState, text string) {
 	if text == "" {
 		return
+	}
+	if !state.rawSpecialTokens {
+		for _, pattern := range qualityRawSpecialTokenPatterns {
+			if pattern.MatchString(text) {
+				state.rawSpecialTokens = true
+				break
+			}
+		}
 	}
 	state.visibleRunes += utf8.RuneCountInString(text)
 }

@@ -72,6 +72,10 @@ type QualityStreamSignals struct {
 	// excluding the usage-derived VisibleTokens fallback. Tool-call arguments
 	// inflate usage.completion_tokens but are not chat text.
 	StreamedTextTokens int64
+	// RawSpecialTokens reports that raw model control tokens (<|eos|>,
+	// <|endoftext|>, ...) leaked into visible output. That is unambiguous
+	// upstream degradation: a healthy stream never exposes them.
+	RawSpecialTokens bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -151,6 +155,11 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if sig.HasThinking {
 		return QualityDeliver
 	}
+	// Raw control tokens in visible output are unambiguous upstream
+	// degradation regardless of any other signal.
+	if sig.RawSpecialTokens {
+		return QualityWithhold
+	}
 	// A structured tool call is the healthy shape of a mechanical agentic turn.
 	// Grok Build legitimately skips streamed reasoning before routine tool
 	// calls, and usage.completion_tokens counts the call arguments, so token
@@ -184,7 +193,13 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 		if enough {
 			return QualityWithhold
 		}
-		return QualityDeliver
+		// A tiny terminal no-thinking stream with no structured tool call is
+		// the agentic give-up signature (1-4 token stops, empty summaries,
+		// premature "done"). The short-output deliver exemption exists for
+		// "ok"/"yes" utility replies, but those never reach this classifier:
+		// shouldHoldQualityStream only holds agentic requests. Inside a tool
+		// loop, short + terminal + no-thinking + no-tool-call is degradation.
+		return QualityWithhold
 	}
 	if enough {
 		return QualityWithhold
