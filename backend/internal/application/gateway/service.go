@@ -1502,6 +1502,57 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || !attemptPolicy.hasNext(attempt))
+		// Classify 400 session-state rejections (stale compaction blob /
+		// encrypted reasoning after account rotation) before the generic
+		// response path: isRetryable(400) is false, so without this the 400
+		// would be returned to the client as-is, and the client faithfully
+		// retries the same stale session for hours (observed run 11).
+		if response.StatusCode == http.StatusBadRequest {
+			if body, readErr := readRetryableBody(response.Body); readErr == nil {
+				if failure := newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name); failure.SessionStateRejected {
+					// Identity failure, not a quality degradation: the account
+					// is healthy, only the session-bound state was stale. Retry
+					// IN PLACE with a fresh session identity (same lease) so
+					// pinned conversations (routing limit 1) and suppressed
+					// quality ladders (MaxAttempts=1) can still recover — a
+					// loop continue would need another routing attempt that
+					// neither budget has.
+					sessionStateReset = true
+					s.logger.Warn("upstream_session_state_rejected_retry", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "model", route.UpstreamModel, "upstream_code", failure.UpstreamCode)
+					response, err = forwardResponse(lease, credential, lease.Billing)
+					if err != nil {
+						lease.Release()
+						lastErr = err
+						lastFailure = failure
+						if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+							break
+						}
+						if !isRetryableTransportFailure(credential.Provider, err) {
+							break
+						}
+						continue
+					}
+					if response.StatusCode == http.StatusBadRequest {
+						if retryBody, retryReadErr := readRetryableBody(response.Body); retryReadErr == nil {
+							if retryFailure := newHTTPUpstreamFailure(response.StatusCode, retryBody, credential.ID, credential.Name); retryFailure.SessionStateRejected {
+								// Two fresh-session attempts both rejected: the
+								// conversation is genuinely stuck on xAI-side
+								// state. Surface the 400 rather than loop.
+								lease.Release()
+								lastErr = fmt.Errorf("上游会话状态已失效")
+								lastFailure = retryFailure
+								response.Body = io.NopCloser(bytes.NewReader(retryBody))
+								s.logger.Warn("upstream_session_state_rejected_twice", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider)
+								break
+							}
+							response.Body = io.NopCloser(bytes.NewReader(retryBody))
+						}
+					}
+				} else {
+					response.Body = io.NopCloser(bytes.NewReader(body))
+				}
+			}
+		}
 		// Classify 403 bodies before egress retry. Definitive blocked-account signals invalidate and rotate the account;
 		// request-level safety rejections are returned as-is without account side effects;
 		// all other 403 responses retain the egress retry path without penalizing the account.
@@ -1553,12 +1604,20 @@ attemptLoop:
 			// opaque state once; when it could not complete (e.g. its retry hit
 			// a dead egress node), retry here with a FRESH session identity so
 			// the client never sees a 400 it would faithfully retry against
-			// the same stale session for hours.
+			// the same stale session for hours. (Fresh 400s are classified
+			// and refunded where they arrive; this branch covers failures
+			// carried in via lastFailure from the adapter recovery path.)
 			body, _ := readRetryableBody(response.Body)
 			_ = body
 			lease.Release()
 			lastErr = fmt.Errorf("上游会话状态已失效")
 			s.logger.Warn("upstream_session_state_rejected_retry", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "model", route.UpstreamModel, "upstream_code", lastFailure.UpstreamCode)
+			// Identity failure, not quality degradation: refund the quality
+			// attempt so a suppressed ladder (MaxAttempts=1) can still retry.
+			if qualityHoldEnabled && qualityAccountAttempts > 0 {
+				qualityAccountAttempts--
+				s.logger.Info("quality_attempt_refunded", "request_id", input.RequestID, "account_id", credential.ID, "reason", "session_state_rejected")
+			}
 			// Force a fresh upstream session on the next attempt: same account
 			// is fine (the account is healthy), but the session identity and
 			// the reasoning replay keyed to it must be discarded.

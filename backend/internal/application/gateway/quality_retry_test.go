@@ -1627,3 +1627,122 @@ func TestAttemptLoopQualityRejectMemoryAndNoPenalty(t *testing.T) {
 		}
 	}
 }
+
+// TestAttemptLoopSessionStateRejectionRefundsQualityBudget reproduces run 11:
+// a reject-memory-suppressed retry (MaxAttempts=1) whose single attempt hits
+// xAI's "Could not decode the compaction blob" 400. The session-state
+// rejection is an identity failure, not a quality degradation — it must be
+// refunded so the fresh-session recovery can run, instead of leaking the 400
+// to the client (which faithfully retries the same stale blob and dies).
+func TestAttemptLoopSessionStateRejectionRefundsQualityBudget(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "session-state-refund.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "session-state", SourceKey: "session-state", EncryptedAccessToken: "session-state",
+		EncryptedRefreshToken: "refresh-session-state", ExpiresAt: time.Now().Add(time.Hour),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "session-state-key", Prefix: "sstate", SecretHash: strings.Repeat("b", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First attempt: stale compaction blob 400 (the account rotated under the
+	// conversation's xAI session state). Second attempt: healthy thinking
+	// stream — the fresh-session recovery must reach it.
+	blobRejected := `{"code":"invalid-argument","error":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}`
+	healthy := sse(
+		`data: {"choices":[{"delta":{"reasoning_content":"`+strings.Repeat("think ", 16)+`"}}]}`,
+		`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credential.ID: {
+			{status: http.StatusBadRequest, body: blobRejected},
+			{status: http.StatusOK, body: healthy},
+		},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	// Reject memory ON for this conversation: simulate a prior reject by
+	// first sending a request that fails closed (no-thinking storm), then the
+	// suppressed client retry that hits the blob 400.
+	service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, MaxAttempts: 3, MinOutputTokens: 32, OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second})
+
+	body := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`)
+	// Request 1: all accounts withhold (no thinking) -> fail-closed reject,
+	// populating the 10-min reject memory for this conversation.
+	noThink := sse(
+		`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)
+	adapter.responses[credential.ID] = []scriptedBuildResponse{
+		{status: http.StatusOK, body: noThink},
+		{status: http.StatusOK, body: noThink},
+		{status: http.StatusOK, body: noThink},
+		{status: http.StatusOK, body: noThink},
+	}
+	_, _ = service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-sstate-1", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+
+	// Request 2 (suppressed, MaxAttempts=1): first attempt returns the blob
+	// 400; the refund must let the fresh-session retry deliver the healthy
+	// thinking stream instead of leaking the 400.
+	adapter.responses[credential.ID] = []scriptedBuildResponse{
+		{status: http.StatusBadRequest, body: blobRejected},
+		{status: http.StatusOK, body: healthy},
+	}
+	result, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-sstate-2", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err != nil {
+		t.Fatalf("suppressed retry must recover from session-state rejection via fresh session: %v", err)
+	}
+	defer result.Body.Close()
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("recovered status = %d, want 200 (blob 400 must not leak)", result.StatusCode)
+	}
+	attempts := len(adapter.Attempts())
+	if attempts < 2 {
+		t.Fatalf("expected blob-400 attempt + fresh-session retry, got %d attempts", attempts)
+	}
+	// The account must not be penalized for xAI's stale session state.
+	stored, getErr := accountRepo.Get(ctx, credential.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if !stored.Enabled || stored.CooldownUntil != nil {
+		t.Fatalf("session-state rejection must not penalize the account: %#v", stored)
+	}
+}
