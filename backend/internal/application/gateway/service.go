@@ -1086,6 +1086,20 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	qualityLadderSuppressed := qualityHoldEnabled && s.qualityRejectLadderSuppressed(affinityKey)
 	if qualityLadderSuppressed {
 		holdCfg.MaxAttempts = 1
+		// The client is retrying a conversation whose ladder was rejected
+		// moments ago. Its single attempt is the only quality chance this
+		// retry gets, and a byte-identical replay re-triggers the same
+		// content-deterministic withhold. Pin the strongest effort the
+		// model's Provider contract supports (xhigh when available): the
+		// escalated-effort path recovers ~70% of withheld requests.
+		if effort := strongestSupportedReasoningEffort(route.Provider, publicModel); effort != "" {
+			if rewritten, rewriteErr := rewriteAliasedModel(input.Body, publicModel, effort, operation); rewriteErr == nil {
+				input.Body = rewritten
+				s.logger.Info("quality_reject_memory_effort_pinned", "request_id", input.RequestID, "effort", effort)
+			} else {
+				s.logger.Warn("quality_reject_memory_effort_pin_failed", "request_id", input.RequestID, "error", rewriteErr)
+			}
+		}
 		s.logger.Info("quality_reject_memory_hit", "request_id", input.RequestID)
 	}
 	// Count accounts that actually reached the upstream. Credential-only skips

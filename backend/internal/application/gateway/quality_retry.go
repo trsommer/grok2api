@@ -661,3 +661,37 @@ func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, 
 		s.logger.Error("quality_degraded_audit_failed", "event_id", record.EventID, "request_id", record.RequestID, "error", err)
 	}
 }
+
+// strongestSupportedReasoningEffort returns the strongest controllable effort
+// the Provider's wire contract accepts for the model (xhigh > high > medium >
+// low), or "" when the model cannot be pinned (none-only or fixed-reasoning).
+// Reject-memory-suppressed retries run a single attempt; pinning the strongest
+// effort makes that attempt the most likely to break the content-deterministic
+// withhold without violating the model's capability contract.
+func strongestSupportedReasoningEffort(provider accountdomain.Provider, publicModel string) string {
+	if modeldomain.IsFixedReasoningForProvider(provider, publicModel) {
+		return ""
+	}
+	best := ""
+	bestRank := 0
+	for _, level := range modeldomain.SupportedReasoningEffortsForProvider(provider, publicModel) {
+		rank := 0
+		switch level {
+		case modeldomain.ReasoningEffortLow:
+			rank = 1
+		case modeldomain.ReasoningEffortMedium:
+			rank = 2
+		case modeldomain.ReasoningEffortHigh:
+			rank = 3
+		case modeldomain.ReasoningEffortXHigh:
+			rank = 4
+		default:
+			continue // none/max/unknown are not pinnable
+		}
+		if rank > bestRank {
+			bestRank = rank
+			best = level
+		}
+	}
+	return best
+}

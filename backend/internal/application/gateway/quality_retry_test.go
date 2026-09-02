@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1746,5 +1747,151 @@ func TestAttemptLoopSessionStateRejectionRefundsQualityBudget(t *testing.T) {
 	}
 	if !stored.Enabled || stored.CooldownUntil != nil {
 		t.Fatalf("session-state rejection must not penalize the account: %#v", stored)
+	}
+}
+
+// TestAttemptLoopSuppressedRetryPinsStrongestEffort covers lever #3: a
+// reject-memory-suppressed retry (MaxAttempts=1) must run its single attempt
+// at the strongest effort the model's provider contract supports (xhigh for
+// grok-4.6), instead of replaying the default-effort bytes that already
+// failed closed. The escalated-effort path recovers ~70% of withheld
+// requests, but a 1-attempt ladder never escalates on its own.
+func TestAttemptLoopSuppressedRetryPinsStrongestEffort(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "suppressed-effort.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "effort-pin", SourceKey: "effort-pin", EncryptedAccessToken: "effort-pin",
+		EncryptedRefreshToken: "refresh-effort-pin", ExpiresAt: time.Now().Add(time.Hour),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "effort-pin-key", Prefix: "epin", SecretHash: strings.Repeat("c", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noThink := func() string {
+		return sse(
+			`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+			`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+			"data: [DONE]",
+		)
+	}
+	healthy := sse(
+		`data: {"choices":[{"delta":{"reasoning_content":"`+strings.Repeat("think ", 16)+`"}}]}`,
+		`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)
+
+	// Request 1 (ladder): every attempt withholds -> fail-closed reject,
+	// populating reject memory. Request 2 (suppressed): a single attempt
+	// whose body must carry reasoning.effort=xhigh.
+	adapter := &scriptedBuildAdapter{
+		responses: map[uint64][]scriptedBuildResponse{
+			credential.ID: {
+				{status: http.StatusOK, body: noThink()},
+				{status: http.StatusOK, body: noThink()},
+				{status: http.StatusOK, body: noThink()},
+				{status: http.StatusOK, body: noThink()},
+			},
+		},
+		bodies: [][]byte{},
+	}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, MaxAttempts: 3, MinOutputTokens: 32, OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second})
+
+	body := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`)
+	// Request 1: no-thinking storm -> reject memory populated.
+	_, _ = service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-effort-1", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	ladderAttemptCount := len(adapter.Attempts())
+	if ladderAttemptCount == 0 {
+		t.Fatal("expected ladder attempts on first request")
+	}
+
+	// Request 2: suppressed retry — must be exactly ONE attempt at xhigh.
+	adapter.responses[credential.ID] = []scriptedBuildResponse{
+		{status: http.StatusOK, body: healthy},
+	}
+	beforeAttempts := len(adapter.Attempts())
+	result2, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-effort-2", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err != nil {
+		t.Fatalf("suppressed retry with healthy stream must deliver: %v", err)
+	}
+	_ = result2.Body.Close()
+	suppressedAttempts := len(adapter.Attempts()) - beforeAttempts
+	if suppressedAttempts != 1 {
+		t.Fatalf("reject memory must collapse the retry ladder to 1 attempt, got %d", suppressedAttempts)
+	}
+
+	// The single suppressed attempt's body must pin xhigh effort. The last
+	// captured body belongs to the suppressed retry. This test drives the
+	// chat-completions operation, so the effort is encoded as a top-level
+	// reasoning_effort field.
+	capturedBodies := adapter.bodies
+	if len(capturedBodies) == 0 {
+		t.Fatal("expected captured request bodies")
+	}
+	suppressedBody := capturedBodies[len(capturedBodies)-1]
+	var payload map[string]any
+	if err := json.Unmarshal(suppressedBody, &payload); err != nil {
+		t.Fatalf("captured body is not JSON: %v", err)
+	}
+	if payload["reasoning_effort"] != modeldomain.ReasoningEffortXHigh {
+		t.Fatalf("suppressed retry must pin reasoning_effort=xhigh, got body: %s", suppressedBody)
+	}
+	// Contrast: the ladder's FIRST attempt carries no effort pin (the test
+	// service configures no default reasoning effort), proving the xhigh on
+	// the suppressed retry comes from the reject-memory pin and not from a
+	// global default. (Later ladder attempts legitimately escalate on their
+	// own; those are exempt from this contrast.)
+	var ladderFirst map[string]any
+	if err := json.Unmarshal(capturedBodies[0], &ladderFirst); err != nil {
+		t.Fatalf("first ladder body is not JSON: %v", err)
+	}
+	if ladderFirst["reasoning_effort"] != nil {
+		t.Fatalf("first ladder attempt must not carry an effort pin, got body: %s", capturedBodies[0])
+	}
+	// Strongest-effort helper sanity across contracts.
+	if effort := strongestSupportedReasoningEffort(accountdomain.ProviderBuild, "grok-4.6"); effort != modeldomain.ReasoningEffortXHigh {
+		t.Fatalf("grok-4.6 strongest effort = %q, want xhigh", effort)
+	}
+	if effort := strongestSupportedReasoningEffort(accountdomain.ProviderBuild, "grok-4.5"); effort != modeldomain.ReasoningEffortHigh {
+		t.Fatalf("grok-4.5 strongest effort = %q, want high (xhigh unsupported)", effort)
+	}
+	if effort := strongestSupportedReasoningEffort(accountdomain.ProviderConsole, "grok-4.20-0309-reasoning"); effort != "" {
+		t.Fatalf("fixed-reasoning model must not be pinned, got %q", effort)
 	}
 }

@@ -4166,6 +4166,10 @@ type scriptedBuildAdapter struct {
 	responses     map[uint64][]scriptedBuildResponse
 	refreshes     atomic.Int64
 	lastRateLimit *provider.RateLimitMetadata
+	// bodies, when non-nil, records the request body of every
+	// ForwardResponse call (appended in order). Optional so existing tests
+	// are unaffected.
+	bodies [][]byte
 }
 
 func (a *scriptedBuildAdapter) Provider() account.Provider { return account.ProviderBuild }
@@ -4179,6 +4183,9 @@ func (a *scriptedBuildAdapter) ForwardResponse(_ context.Context, request provid
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.attempts = append(a.attempts, request.Credential.ID)
+	if a.bodies != nil {
+		a.bodies = append(a.bodies, append([]byte(nil), request.Body...))
+	}
 	queue := a.responses[request.Credential.ID]
 	if len(queue) == 0 {
 		return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"resp-default"}`))}, nil
