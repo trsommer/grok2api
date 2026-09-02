@@ -235,7 +235,17 @@ type Service struct {
 	// re-walking the account pool and stacking cooldowns.
 	qualityRejectMu      sync.Mutex
 	qualityRejectRecent  map[string]time.Time
+	// qualityThinkingMu tracks conversations that have DELIVERED real streamed
+	// thinking. A tool-call turn (SemanticOutput) with no thinking in such a
+	// session is suspect: the session has proven the model thinks on this
+	// content, so a no-think mechanical turn is degradation, not a legitimate
+	// quick call (run 12: 22-minute no-op edit loop delivered via the
+	// SemanticOutput exemption).
+	qualityThinkingMu      sync.Mutex
+	qualityThinkingRecent  map[string]time.Time
 }
+
+const qualityThinkingMemoryTTL = 2 * time.Hour
 
 type teamModelRateLimit struct {
 	TeamFingerprint string
@@ -274,6 +284,7 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
 		modelSyncing: make(map[uint64]struct{}), qualityRejectRecent: make(map[string]time.Time),
+		qualityThinkingRecent: make(map[string]time.Time),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
@@ -1759,7 +1770,7 @@ attemptLoop:
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				replay, verdict, peekUsage, _, peekHasThinking, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, s.qualityConversationHasThinking(affinityKey))
 				if peekErr != nil {
 					if replay != nil {
 						_ = replay.Close()
@@ -1873,6 +1884,13 @@ attemptLoop:
 					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
 				case QualityActionDeliver:
 					discardFallback(true)
+				}
+				// Record real thinking evidence for this conversation: later
+				// no-think tool-call turns in the same session are then
+				// suspect (degraded mechanical loops) instead of being
+				// auto-delivered via the SemanticOutput exemption.
+				if peekHasThinking {
+					s.rememberQualityThinking(affinityKey)
 				}
 				// A delivered stream proves the ladder recovered. Earlier
 				// strikes were genuine account degradation: flush the

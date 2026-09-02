@@ -40,6 +40,8 @@ func TestClassifyQualityHold(t *testing.T) {
 		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityWithhold},
 		{name: "short no think terminal withholds in agentic holds", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityWithhold},
 		{name: "short no think with tool call delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true, SemanticOutput: true}, want: QualityDeliver},
+		{name: "tool call in thinking session withholds (degraded mechanical turn)", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true, SemanticOutput: true, SessionHasThinking: true}, want: QualityWithhold},
+		{name: "tool call with thinking delivers regardless of session baseline", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true, SemanticOutput: true, HasThinking: true, SessionHasThinking: true}, want: QualityDeliver},
 		{name: "empty terminal waits for transport handling", sig: QualityStreamSignals{Terminal: true}, want: QualityWait},
 		{name: "midstream enough content withhold", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWithhold},
 		{name: "stub midstream waits even with enough visible", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64}, want: QualityWait},
@@ -541,7 +543,7 @@ func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":"answer after think"}}]}`,
 		"data: [DONE]",
 	)))
-	replay, verdict, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second})
+	replay, verdict, _, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +566,7 @@ func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
 		"data: [DONE]",
 	)))
-	replay, verdict, usage, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second})
+	replay, verdict, usage, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,7 +589,7 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 	)
 	cfg := QualityRetryRuntime{MinOutputTokens: 32, MaxAttempts: 2, OnExhausted: qualityRetryFailOpen, HoldTimeout: time.Second}
 
-	replay, verdict, usage, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg)
+	replay, verdict, usage, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +601,7 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 		t.Fatalf("first withhold action=%s", got)
 	}
 
-	replay2, verdict2, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg)
+	replay2, verdict2, _, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +626,7 @@ func TestPeekQualityStreamShortDelivers(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":"hi"}}]}`,
 		"data: [DONE]",
 	)))
-	replay, verdict, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32})
+	replay, verdict, _, _, _, err := peekQualityStream(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{MinOutputTokens: 32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +661,7 @@ func TestPeekQualityStreamHoldTimeoutInterruptsBlockedReadAndPreservesRemainder(
 	}()
 
 	started := time.Now()
-	replay, verdict, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolChat, QualityRetryRuntime{
+	replay, verdict, _, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolChat, QualityRetryRuntime{
 		MinOutputTokens: 32,
 		HoldTimeout:     30 * time.Millisecond,
 	})
@@ -717,7 +719,7 @@ func TestPeekQualityStreamHoldTimeoutDeliversStartedReasoningAndPreservesLateEvi
 	}()
 
 	started := time.Now()
-	replay, verdict, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolResponses, QualityRetryRuntime{
+	replay, verdict, _, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolResponses, QualityRetryRuntime{
 		MinOutputTokens: 8,
 		HoldTimeout:     30 * time.Millisecond,
 	})
@@ -754,7 +756,7 @@ func TestPeekQualityStreamHoldTimeoutEmptyDoesNotFailOpen(t *testing.T) {
 	var peekErr error
 	go func() {
 		defer close(done)
-		_, verdict, _, _, peekErr = peekQualityStream(ctx, reader, qualityProtocolChat, QualityRetryRuntime{
+		_, verdict, _, _, _, peekErr = peekQualityStream(ctx, reader, qualityProtocolChat, QualityRetryRuntime{
 			MinOutputTokens: 32,
 			HoldTimeout:     20 * time.Millisecond,
 		})
@@ -793,7 +795,7 @@ func TestPeekQualityStreamHoldTimeoutStubOnlyDoesNotFailOpen(t *testing.T) {
 	var peekErr error
 	go func() {
 		defer close(done)
-		_, verdict, _, _, peekErr = peekQualityStream(ctx, reader, qualityProtocolChat, QualityRetryRuntime{
+		_, verdict, _, _, _, peekErr = peekQualityStream(ctx, reader, qualityProtocolChat, QualityRetryRuntime{
 			MinOutputTokens: 8,
 			HoldTimeout:     20 * time.Millisecond,
 		})
@@ -831,7 +833,7 @@ func peekOpenQualityStreamForTest(t *testing.T, protocol, stream string) quality
 	reader, writer := io.Pipe()
 	done := make(chan qualityOpenPeekResult, 1)
 	go func() {
-		replay, verdict, _, _, err := peekQualityStream(
+		replay, verdict, _, _, _, err := peekQualityStream(
 			context.Background(), reader, protocol,
 			QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: 2 * time.Second},
 		)
@@ -979,7 +981,7 @@ func TestPeekQualityStreamTerminalSemanticOutputIsNotEmpty(t *testing.T) {
 
 func TestPeekQualityStreamEmptyEOFRequestsAnotherAccount(t *testing.T) {
 	t.Parallel()
-	replay, verdict, _, _, err := peekQualityStream(
+	replay, verdict, _, _, _, err := peekQualityStream(
 		context.Background(),
 		io.NopCloser(strings.NewReader("")),
 		qualityProtocolResponses,
@@ -999,7 +1001,7 @@ func TestPeekQualityStreamEmptyEOFRequestsAnotherAccount(t *testing.T) {
 func TestPeekQualityStreamProcessesUnterminatedFinalEvent(t *testing.T) {
 	t.Parallel()
 	body := io.NopCloser(strings.NewReader(`data: {"type":"response.output_text.delta","delta":"ok"}`))
-	replay, verdict, _, _, err := peekQualityStream(
+	replay, verdict, _, _, _, err := peekQualityStream(
 		context.Background(), body, qualityProtocolResponses,
 		QualityRetryRuntime{MinOutputTokens: 32, HoldTimeout: time.Second},
 	)

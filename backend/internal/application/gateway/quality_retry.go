@@ -73,9 +73,15 @@ type QualityStreamSignals struct {
 	// inflate usage.completion_tokens but are not chat text.
 	StreamedTextTokens int64
 	// RawSpecialTokens reports that raw model control tokens (<|eos|>,
-	// <|endoftext|>, ...) leaked into visible output. That is unambiguous
+	// [INST], ...) leaked into visible output. That is unambiguous
 	// upstream degradation: a healthy stream never exposes them.
 	RawSpecialTokens bool
+	// SessionHasThinking reports that this conversation has previously
+	// DELIVERED real thinking evidence. When set, a no-think tool-call turn
+	// is suspect: the session has proven the model thinks on this content,
+	// so a mechanical no-think turn is degradation (run 12: a 22-minute
+	// no-op edit loop delivered via the SemanticOutput exemption).
+	SessionHasThinking bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -168,7 +174,16 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	// and parameter markup dumped as chat text). If a no-thinking turn also
 	// carries substantial streamed plain text, it stays subject to the
 	// withhold below.
+	//
+	// Exception: once this conversation has DELIVERED real thinking, the
+	// model's behavior on this content is proven, and a no-think tool turn
+	// is degradation until thinking returns (degraded mechanical loops:
+	// repeated no-op edits, identical reads). Withhold so the ladder can
+	// rotate to a healthy account instead of delivering the loop.
 	if sig.SemanticOutput && sig.StreamedTextTokens < minOutput {
+		if sig.SessionHasThinking {
+			return QualityWithhold
+		}
 		return QualityDeliver
 	}
 	// Prefer observed/derived visible output. Total output includes reasoning
@@ -573,6 +588,50 @@ func (s *Service) qualityRejectLadderSuppressed(conversationKey string) bool {
 	}
 	if expiry.Before(now) {
 		delete(s.qualityRejectRecent, conversationKey)
+		return false
+	}
+	return true
+}
+
+// rememberQualityThinking records that a conversation DELIVERED a stream with
+// real thinking evidence. Later no-think tool-call turns in the same
+// conversation are then treated as suspect (degraded mechanical turns) by the
+// classifier instead of being auto-delivered via the SemanticOutput exemption.
+func (s *Service) rememberQualityThinking(conversationKey string) {
+	if conversationKey == "" {
+		return
+	}
+	now := time.Now()
+	s.qualityThinkingMu.Lock()
+	defer s.qualityThinkingMu.Unlock()
+	if len(s.qualityThinkingRecent) >= 4096 {
+		for key, expiry := range s.qualityThinkingRecent {
+			if expiry.Before(now) {
+				delete(s.qualityThinkingRecent, key)
+			}
+		}
+		if len(s.qualityThinkingRecent) >= 4096 {
+			s.qualityThinkingRecent = make(map[string]time.Time)
+		}
+	}
+	s.qualityThinkingRecent[conversationKey] = now.Add(qualityThinkingMemoryTTL)
+}
+
+// qualityConversationHasThinking reports whether this conversation has
+// delivered real thinking recently (within qualityThinkingMemoryTTL).
+func (s *Service) qualityConversationHasThinking(conversationKey string) bool {
+	if conversationKey == "" {
+		return false
+	}
+	now := time.Now()
+	s.qualityThinkingMu.Lock()
+	defer s.qualityThinkingMu.Unlock()
+	expiry, ok := s.qualityThinkingRecent[conversationKey]
+	if !ok {
+		return false
+	}
+	if expiry.Before(now) {
+		delete(s.qualityThinkingRecent, conversationKey)
 		return false
 	}
 	return true
