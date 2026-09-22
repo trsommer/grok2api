@@ -1216,11 +1216,20 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
 					status, retryAfter := streamFailureHealthPenalty(errorCode, usage, s.qualityRetryConfig().IdleAccountCooldown)
-					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
+					// A stream that died with zero observed output is usually
+					// a dead egress proxy, not account degradation. Attribute
+					// it to the bound egress lease first; only unbound
+					// accounts (or unavailable writers) fall back to the
+					// account cooldown.
+					writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+					if status != 0 && s.selector.MarkEgressLeaseTransportFailure(writeCtx, credential, retryAfter) {
+						s.logger.Warn("stream_failure_lease_blocked", "account_id", credential.ID, "node_id", credential.EgressNodeID, "code", errorCode, "cooldown", retryAfter)
+					} else if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
 						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, status, retryAfter)
 					}); err != nil {
 						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
 					}
+					writeCancel()
 				}
 				lease.Release()
 				now := time.Now().UTC()
@@ -1470,13 +1479,21 @@ attemptLoop:
 			if status, retryAfter, classified := upstreamResponseErrorHealthPenalty(err, holdCfg.IdleAccountCooldown); classified {
 				responseFailure = true
 				writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
-				markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, status, retryAfter)
-				writeCancel()
-				if markErr != nil {
-					s.logger.Warn("upstream_response_health_write_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+				// Attribute transport-level empty/idle responses to the bound
+				// egress lease (dead proxy) instead of the account health;
+				// fall back to the account cooldown only for unbound accounts
+				// or unavailable lease writers.
+				if status != 0 && s.selector.MarkEgressLeaseTransportFailure(writeCtx, credential, retryAfter) {
+					s.logger.Warn("upstream_response_lease_blocked", "request_id", input.RequestID, "account_id", credential.ID, "node_id", credential.EgressNodeID, "status", status, "cooldown", retryAfter)
 				} else {
-					s.logger.Warn("upstream_response_health_retry", "request_id", input.RequestID, "account_id", credential.ID, "status", status, "minimum_cooldown", retryAfter)
+					markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, status, retryAfter)
+					if markErr != nil {
+						s.logger.Warn("upstream_response_health_write_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+					} else {
+						s.logger.Warn("upstream_response_health_retry", "request_id", input.RequestID, "account_id", credential.ID, "status", status, "minimum_cooldown", retryAfter)
+					}
 				}
+				writeCancel()
 			} else {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
 			}
@@ -1826,7 +1843,17 @@ attemptLoop:
 							logPrefix = "quality_peek_empty"
 						}
 						writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
-						if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, http.StatusGatewayTimeout, holdCfg.IdleAccountCooldown); markErr != nil {
+						// Transport-level attribution: an empty/idle stream
+						// with zero bytes is usually a dead egress proxy, not
+						// account degradation. Block the account's bound
+						// egress lease (short, node-scoped) instead of running
+						// the account cooldown, so a proxy flap cannot cool
+						// ~25 accounts-per-node into a 502 storm. Only when
+						// the account is unbound or the writer is unavailable
+						// do we fall back to the configured account cooldown.
+						if s.selector.MarkEgressLeaseTransportFailure(writeCtx, credential, holdCfg.IdleAccountCooldown) {
+							s.logger.Warn(logPrefix+"_lease_blocked", "request_id", input.RequestID, "account_id", credential.ID, "node_id", credential.EgressNodeID, "cooldown", holdCfg.IdleAccountCooldown)
+						} else if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, http.StatusGatewayTimeout, holdCfg.IdleAccountCooldown); markErr != nil {
 							s.logger.Warn(logPrefix+"_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
 						} else {
 							s.logger.Warn(logPrefix+"_retry", "request_id", input.RequestID, "account_id", credential.ID, "cooldown", holdCfg.IdleAccountCooldown)

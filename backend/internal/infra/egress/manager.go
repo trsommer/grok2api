@@ -560,6 +560,14 @@ func (m *Manager) ProbeEgressNode(ctx context.Context, node domain.Node) (domain
 	if result.Error == "" {
 		result.Error = "IPv4 和 IPv6 代理探测均失败"
 	}
+	// Both families failed — this is a real node outage, the single
+	// authoritative warning (per-family failures log at debug above).
+	m.log().WarnContext(ctx, "egress_probe_failed",
+		"node_id", node.ID, "node_name", node.Name, "scope", node.Scope,
+		"probe_provider", provider, "address_family", "all",
+		"stage", "aggregate", "probe_error", result.Error,
+		"ipv4_status", result.IPv4.Status, "ipv6_status", result.IPv6.Status,
+	)
 	return result, errors.Join(ipv4Err, ipv6Err, errors.New(result.Error))
 }
 
@@ -673,7 +681,12 @@ func (m *Manager) probeEgressEndpoint(ctx context.Context, target preparedEgress
 			if probeErr != nil {
 				attributes = append(attributes, "error", sanitizeFlareSolverrMessage(probeErr.Error()))
 			}
-			m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+			// A single-family failure (notably the IPv6 path on this pool's
+			// free SOCKS5 proxies) is not a node outage: the node health is
+			// decided by the aggregate of both families in ProbeEgressNode.
+			// Log per-family failures at debug to stop the false-alarm storm
+			// while keeping the authoritative aggregate warning intact.
+			m.log().DebugContext(ctx, "egress_probe_failed_family", attributes...)
 			return
 		}
 		attributes = append(attributes, "latency_ms", result.LatencyMS, "exit_ip", result.ExitIP)

@@ -188,7 +188,7 @@ func TestProbeEgressNodeLogsSuccessWithoutProxyCredentials(t *testing.T) {
 		}}, nil
 	}
 	var output bytes.Buffer
-	manager.SetLogger(slog.New(slog.NewTextHandler(&output, nil)))
+	manager.SetLogger(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	result, err := manager.probeEgressEndpoint(context.Background(), preparedEgressProbe{
 		nodeID: 42, nodeName: "web-us", nodeScope: domain.ScopeWeb, proxyURL: "socks5://user:secret@proxy.example:1080",
@@ -225,7 +225,7 @@ func TestProbeEgressNodeLogsSanitizedFailureStage(t *testing.T) {
 		}}, nil
 	}
 	var output bytes.Buffer
-	manager.SetLogger(slog.New(slog.NewTextHandler(&output, nil)))
+	manager.SetLogger(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	result, err := manager.probeEgressEndpoint(context.Background(), preparedEgressProbe{
 		nodeID: 7, nodeName: "web-jp", nodeScope: domain.ScopeWeb, proxyURL: "socks5://user:secret@proxy.example:1080",
@@ -255,7 +255,7 @@ func TestProbeEgressNodeClassifiesTLSFailure(t *testing.T) {
 		}}, nil
 	}
 	var output bytes.Buffer
-	manager.SetLogger(slog.New(slog.NewTextHandler(&output, nil)))
+	manager.SetLogger(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	result, err := manager.probeEgressEndpoint(context.Background(), preparedEgressProbe{
 		nodeID: 8, nodeName: "tls-failure", nodeScope: domain.ScopeBuild, proxyURL: "http://proxy.example:1080",
@@ -282,7 +282,7 @@ func TestProbeEgressNodeClassifiesFirstByteFailure(t *testing.T) {
 		}}, nil
 	}
 	var output bytes.Buffer
-	manager.SetLogger(slog.New(slog.NewTextHandler(&output, nil)))
+	manager.SetLogger(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	result, err := manager.probeEgressEndpoint(context.Background(), preparedEgressProbe{
 		nodeID: 9, nodeName: "first-byte-failure", nodeScope: domain.ScopeBuild, proxyURL: "http://proxy.example:1080",
@@ -304,7 +304,7 @@ func TestProbeEgressNodeKeepsUntracedFailureAtExecuteRequest(t *testing.T) {
 		}}, nil
 	}
 	var output bytes.Buffer
-	manager.SetLogger(slog.New(slog.NewTextHandler(&output, nil)))
+	manager.SetLogger(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	_, err := manager.probeEgressEndpoint(context.Background(), preparedEgressProbe{
 		nodeID: 10, nodeName: "untraced-failure", nodeScope: domain.ScopeBuild, proxyURL: "http://proxy.example:1080",

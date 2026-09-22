@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
@@ -289,10 +290,21 @@ func (l *accountLease) completeSelectorObservation(success bool) {
 }
 
 // Selector 实现可替换的 balanced 账号选择策略。
+// egressLeaseBlockWriter writes durable account+node lease blocks. Transport-
+// level stream failures (empty/idle streams from a dead proxy) must be
+// attributed to the egress lease, not the account: the node is shared by many
+// accounts, and cooling the account for a proxy fault cascades into pool
+// exhaustion. Only the relational repository implements this; a nil writer
+// degrades gracefully back to the existing account cooldown path.
+type egressLeaseBlockWriter interface {
+	UpsertEgressLeaseBlock(ctx context.Context, value account.EgressLeaseBlock) (account.EgressLeaseBlock, error)
+}
+
 type Selector struct {
 	accounts               repository.AccountRepository
 	concurrency            repository.ConcurrencyLimiter
 	sticky                 repository.StickySessionRepository
+	leaseBlocks            egressLeaseBlockWriter
 	stickyTTL              time.Duration
 	cooldownBase           time.Duration
 	cooldownMax            time.Duration
@@ -337,7 +349,54 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), healthOverrides: make(map[uint64]routingHealthOverride), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	var leaseBlocks egressLeaseBlockWriter
+	if writer, ok := accounts.(egressLeaseBlockWriter); ok {
+		leaseBlocks = writer
+	}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, leaseBlocks: leaseBlocks, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), healthOverrides: make(map[uint64]routingHealthOverride), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+}
+
+// MarkEgressLeaseTransportFailure attributes a transport-level stream failure
+// (empty/idle stream, dead proxy) to the account's bound egress lease instead
+// of the account's health. The egress node is shared by ~25 accounts; cooling
+// the account for a proxy fault cascades into pool exhaustion and 502 storms.
+// Returns true when a durable lease block was written (or a longer one already
+// existed); false when the account is unbound or no writer is available, in
+// which case callers fall back to the configured account cooldown.
+func (s *Selector) MarkEgressLeaseTransportFailure(ctx context.Context, credential account.Credential, cooldown time.Duration) bool {
+	if s == nil || s.leaseBlocks == nil || credential.EgressNodeID == 0 || cooldown <= 0 {
+		return false
+	}
+	version, err := newLeaseBlockVersion()
+	if err != nil {
+		return false
+	}
+	now := time.Now().UTC()
+	_, err = s.leaseBlocks.UpsertEgressLeaseBlock(ctx, account.EgressLeaseBlock{
+		AccountID:     credential.ID,
+		NodeID:        credential.EgressNodeID,
+		Reason:        "upstream_transport_failure",
+		Version:       version,
+		CooldownUntil: now.Add(cooldown),
+		UpdatedAt:     now,
+	})
+	if err != nil {
+		if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
+			// A longer, more recent block already exists on this lease: the
+			// node is already cooling; nothing more to do.
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+func newLeaseBlockVersion() (string, error) {
+	buf := make([]byte, 18)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // SetLogger wires the application logger into routing degradation diagnostics.

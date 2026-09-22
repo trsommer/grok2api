@@ -1936,3 +1936,70 @@ func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func()
 func (f failingConcurrencyLimiter) Current(context.Context, string) (int, error) {
 	return 0, nil
 }
+
+func TestMarkEgressLeaseTransportFailureBlocksOnlyBoundLease(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "lease-attribution.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	egressNodes := relational.NewEgressRepository(database)
+	node, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "dead-proxy", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "socks5://127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	bound, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "bound", SourceKey: "bound", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: node.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbound, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "unbound", SourceKey: "unbound", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+
+	// Bound account: the transport failure is attributed to the egress lease,
+	// not the account health.
+	if !selector.MarkEgressLeaseTransportFailure(ctx, bound, 3*time.Minute) {
+		t.Fatal("expected lease block written for bound account")
+	}
+	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderBuild, 0, "grok-test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen *account.EgressLeaseBlock
+	for i := range candidates {
+		if candidates[i].Credential.ID == bound.ID {
+			seen = candidates[i].EgressLeaseBlock
+			break
+		}
+	}
+	if seen == nil || seen.NodeID != node.ID {
+		t.Fatalf("bound account candidate = %#v, want egress lease block on node %d", seen, node.ID)
+	}
+
+	// A fresh selector reload (no cache) must see the account cooling.
+	reloaded := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	if _, err := reloaded.AcquirePinnedForKey(ctx, account.ProviderBuild, bound.ID, 0, "grok-test", "", true, clientkeydomain.AccountScope{}); err == nil {
+		t.Fatal("bound account was still eligible after its egress lease was blocked")
+	}
+
+	// Unbound account: no lease to attribute to, caller falls back to account
+	// cooldown (returns false).
+	if selector.MarkEgressLeaseTransportFailure(ctx, unbound, 3*time.Minute) {
+		t.Fatal("expected false for unbound account (fall back to account cooldown)")
+	}
+}
