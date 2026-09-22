@@ -235,6 +235,10 @@ type Service struct {
 	// re-walking the account pool and stacking cooldowns.
 	qualityRejectMu      sync.Mutex
 	qualityRejectRecent  map[string]time.Time
+	// qualityRejectAccounts records which accounts a suppressed conversation
+	// already burned, so its single quality attempt rotates to a different
+	// account instead of replaying the sticky one that just failed closed.
+	qualityRejectAccounts map[string][]uint64
 	// qualityThinkingMu tracks conversations that have DELIVERED real streamed
 	// thinking. A tool-call turn (SemanticOutput) with no thinking in such a
 	// session is suspect: the session has proven the model thinks on this
@@ -284,7 +288,7 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
 		modelSyncing: make(map[uint64]struct{}), qualityRejectRecent: make(map[string]time.Time),
-		qualityThinkingRecent: make(map[string]time.Time),
+		qualityRejectAccounts: make(map[string][]uint64), qualityThinkingRecent: make(map[string]time.Time),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
@@ -1081,11 +1085,29 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
 	// A conversation whose quality-retry ladder was fail-closed rejected
 	// moments ago gets a single quality attempt on client retries: the
-	// withhold is request-content-driven, so re-walking the pool only
-	// stacks cooldowns while the upstream window persists.
+	// withhold is request-content-driven, so re-walking the whole pool only
+	// stacks cooldowns while the upstream window persists. The accounts that
+	// already burned in rejected ladders stay excluded so this single attempt
+	// lands on a DIFFERENT account: degraded no-think output is account-level
+	// (flagged/burnt accounts), and replaying the sticky account re-triggers
+	// the same withhold.
 	qualityLadderSuppressed := qualityHoldEnabled && s.qualityRejectLadderSuppressed(affinityKey)
 	if qualityLadderSuppressed {
 		holdCfg.MaxAttempts = 1
+		rejectedAccounts := s.qualityRejectedAccounts(affinityKey)
+		for _, accountID := range rejectedAccounts {
+			excluded[accountID] = true
+		}
+		// Rotation needs a fallback candidate: if excluding the burned
+		// accounts would leave no account at all (single-account pool or all
+		// others cooling), keep the sticky account eligible — a possible
+		// recovery beats a guaranteed selection failure.
+		if preselectedSession != nil && !preselectedSession.hasAvailableCandidate(excluded, true) {
+			for _, accountID := range rejectedAccounts {
+				delete(excluded, accountID)
+			}
+			s.logger.Info("quality_reject_memory_rotation_skipped", "request_id", input.RequestID, "reason", "no_alternative_account")
+		}
 		// The client is retrying a conversation whose ladder was rejected
 		// moments ago. Its single attempt is the only quality chance this
 		// retry gets, and a byte-identical replay re-triggers the same
@@ -1890,15 +1912,28 @@ attemptLoop:
 				// client, and the withhold is request-content-driven, not
 				// account-driven. Penalizing here burns healthy accounts and
 				// fuels client-retry storms that walk the whole pool.
-				s.rememberQualityReject(affinityKey)
+				// Remember EVERY account that struck during this ladder so a
+				// suppressed client retry rotates past all of them.
+				struckAccounts := make([]uint64, 0, len(qualityWithholdStrikes)+1)
+				for accountID := range qualityWithholdStrikes {
+					struckAccounts = append(struckAccounts, accountID)
+				}
+				struckAccounts = append(struckAccounts, credential.ID)
+				s.rememberQualityReject(affinityKey, struckAccounts...)
 				s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
 				break attemptLoop
-				case QualityActionDeliverLast:
-					discardFallback(true)
-					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
-				case QualityActionDeliver:
-					discardFallback(true)
-				}
+			case QualityActionDeliverLast:
+				discardFallback(true)
+				s.forgetQualityReject(affinityKey)
+				s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+			case QualityActionDeliver:
+				discardFallback(true)
+				// A delivered stream ends the reject memory: the conversation
+				// recovered (rotation or escalation worked), so later turns
+				// get the full retry ladder again instead of a single
+				// suppressed attempt on an excluded account set.
+				s.forgetQualityReject(affinityKey)
+			}
 				// Record real thinking evidence for this conversation: later
 				// no-think tool-call turns in the same session are then
 				// suspect (degraded mechanical loops) instead of being

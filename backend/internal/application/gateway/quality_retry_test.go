@@ -1895,3 +1895,171 @@ func TestAttemptLoopSuppressedRetryPinsStrongestEffort(t *testing.T) {
 		t.Fatalf("fixed-reasoning model must not be pinned, got %q", effort)
 	}
 }
+
+// TestAttemptLoopSuppressedRetryRotatesAccount covers reject-memory rotation:
+// a fail-closed ladder remembers the sticky account that burned, so the
+// client's suppressed retry (MaxAttempts=1) lands on a DIFFERENT account
+// instead of replaying rotate-a. Degraded no-think output is account-level;
+// a byte-identical sticky replay re-triggers the same withhold.
+func TestAttemptLoopSuppressedRetryRotatesAccount(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-rotate-account.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credentials := make([]accountdomain.Credential, 0, 3)
+	for index, name := range []string{"rotate-a", "rotate-b", "rotate-c"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name, EncryptedAccessToken: name,
+			EncryptedRefreshToken: "refresh-" + name, ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "quality-rotate-key", Prefix: "qrotate", SecretHash: strings.Repeat("9", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noThink := func() string {
+		return sse(
+			`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+			`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+			"data: [DONE]",
+		)
+	}
+	healthy := sse(
+		`data: {"choices":[{"delta":{"reasoning_content":"`+strings.Repeat("think ", 16)+`"}}]}`,
+		`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)
+	// Request 1 walks sticky rotate-a (first strike + same-account retry) then
+	// rotates. Extra noThink copies keep the fail-closed reject independent of
+	// which accounts the ladder actually touches.
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credentials[0].ID: {{status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}},
+		credentials[1].ID: {{status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}},
+		credentials[2].ID: {{status: http.StatusOK, body: noThink()}, {status: http.StatusOK, body: noThink()}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, MaxAttempts: 3, MinOutputTokens: 32, OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second})
+
+	body := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true,"tools":[{"type":"function","function":{"name":"edit"}}]}`)
+	result, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-rotate-1", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err == nil {
+		_ = result.Body.Close()
+		t.Fatal("fail-closed ladder must reject the request")
+	}
+	if result != nil && result.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("reject status = %d, want 503", result.StatusCode)
+	}
+	if firstAttempts := len(adapter.Attempts()); firstAttempts == 0 {
+		t.Fatal("expected upstream attempts on first request")
+	}
+	for _, credential := range credentials {
+		stored, getErr := accountRepo.Get(ctx, credential.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if !stored.Enabled || stored.CooldownUntil != nil || stored.LastError == lastErrorMissingThinking {
+			t.Fatalf("fail-closed reject must not penalize accounts: %#v", stored)
+		}
+	}
+
+	// Request 2 (client retry of the same conversation): reject memory
+	// collapses the ladder to one attempt and excludes the sticky account
+	// that burned. rotate-a has no scripted response — if the suppressed
+	// retry replayed it, the empty stream would 504-cooldown and fail.
+	// rotate-b (and rotate-c as a fallback if both struck accounts are
+	// excluded) returns a healthy thinking stream.
+	adapter.responses[credentials[0].ID] = nil
+	adapter.responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: healthy}}
+	adapter.responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: healthy}}
+	before := len(adapter.Attempts())
+	result2, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-rotate-2", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err != nil {
+		t.Fatalf("suppressed retry must rotate off sticky rotate-a and deliver: %v", err)
+	}
+	if result2.StatusCode != http.StatusOK {
+		_ = result2.Body.Close()
+		t.Fatalf("rotated suppressed retry status = %d, want 200", result2.StatusCode)
+	}
+	got, readErr := io.ReadAll(result2.Body)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	result2.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 40}, "chat-rotate", "")
+	_ = result2.Body.Close()
+	if !strings.Contains(string(got), "think ") {
+		t.Fatalf("client must receive the rotated thinking stream, got %s", got)
+	}
+	req2Attempts := adapter.Attempts()[before:]
+	if len(req2Attempts) != 1 {
+		t.Fatalf("reject memory must collapse the retry ladder to 1 attempt, got %d (%#v)", len(req2Attempts), req2Attempts)
+	}
+	if req2Attempts[0] == credentials[0].ID {
+		t.Fatalf("suppressed retry must not replay sticky rotate-a, attempts=%#v", req2Attempts)
+	}
+	for _, credential := range credentials {
+		stored, getErr := accountRepo.Get(ctx, credential.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if !stored.Enabled || stored.CooldownUntil != nil {
+			t.Fatalf("suppressed retry must not penalize accounts: %#v", stored)
+		}
+	}
+
+	// Request 3: successful delivery clears reject memory, so the full
+	// retry ladder is restored. Healthy responses everywhere just confirm
+	// the conversation is no longer pinned to a single excluded attempt.
+	adapter.responses[credentials[0].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: healthy}}
+	adapter.responses[credentials[1].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: healthy}}
+	adapter.responses[credentials[2].ID] = []scriptedBuildResponse{{status: http.StatusOK, body: healthy}}
+	result3, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-rotate-3", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true, Body: body,
+	})
+	if err != nil {
+		t.Fatalf("cleared reject memory must restore a normal delivery: %v", err)
+	}
+	if result3.StatusCode != http.StatusOK {
+		_ = result3.Body.Close()
+		t.Fatalf("request 3 status = %d, want 200", result3.StatusCode)
+	}
+	_, _ = io.ReadAll(result3.Body)
+	result3.Finalize(Usage{Reported: true, OutputTokens: 40, ReasoningTokens: 40}, "chat-rotate-3", "")
+	_ = result3.Body.Close()
+}

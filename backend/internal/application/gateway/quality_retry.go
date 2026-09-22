@@ -551,8 +551,12 @@ const qualityRejectMemoryTTL = 10 * time.Minute
 
 // rememberQualityReject records that a conversation's quality-retry ladder
 // ended in fail-closed rejection, so immediate client retries fail fast
-// instead of re-walking the account pool.
-func (s *Service) rememberQualityReject(conversationKey string) {
+// instead of re-walking the account pool. The rejected account is remembered
+// alongside the conversation so the suppressed single attempt rotates to a
+// different account: the dominant withhold cause is account-level degradation
+// (flagged/burnt accounts), and replaying the same sticky account is a
+// byte-identical retry that re-triggers the withhold.
+func (s *Service) rememberQualityReject(conversationKey string, accountIDs ...uint64) {
 	if conversationKey == "" {
 		return
 	}
@@ -563,13 +567,73 @@ func (s *Service) rememberQualityReject(conversationKey string) {
 		for key, expiry := range s.qualityRejectRecent {
 			if expiry.Before(now) {
 				delete(s.qualityRejectRecent, key)
+				delete(s.qualityRejectAccounts, key)
 			}
 		}
 		if len(s.qualityRejectRecent) >= 4096 {
 			s.qualityRejectRecent = make(map[string]time.Time)
+			s.qualityRejectAccounts = make(map[string][]uint64)
 		}
 	}
 	s.qualityRejectRecent[conversationKey] = now.Add(qualityRejectMemoryTTL)
+	accounts := s.qualityRejectAccounts[conversationKey]
+	for _, accountID := range accountIDs {
+		if accountID == 0 {
+			continue
+		}
+		duplicate := false
+		for _, id := range accounts {
+			if id == accountID {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && len(accounts) < 8 {
+			accounts = append(accounts, accountID)
+			s.qualityRejectAccounts[conversationKey] = accounts
+		}
+	}
+}
+
+// forgetQualityReject clears a conversation's reject memory after a ladder
+// attempt delivered a usable stream. The conversation is no longer degraded;
+// keeping the suppression would pin it to one attempt (and an excluded
+// account set) for the rest of the TTL window.
+func (s *Service) forgetQualityReject(conversationKey string) {
+	if conversationKey == "" {
+		return
+	}
+	s.qualityRejectMu.Lock()
+	defer s.qualityRejectMu.Unlock()
+	delete(s.qualityRejectRecent, conversationKey)
+	delete(s.qualityRejectAccounts, conversationKey)
+}
+
+// qualityRejectedAccounts returns the accounts this suppressed conversation
+// already burned through fail-closed rejects within the memory TTL.
+func (s *Service) qualityRejectedAccounts(conversationKey string) []uint64 {
+	if conversationKey == "" {
+		return nil
+	}
+	now := time.Now()
+	s.qualityRejectMu.Lock()
+	defer s.qualityRejectMu.Unlock()
+	expiry, ok := s.qualityRejectRecent[conversationKey]
+	if !ok {
+		return nil
+	}
+	if expiry.Before(now) {
+		delete(s.qualityRejectRecent, conversationKey)
+		delete(s.qualityRejectAccounts, conversationKey)
+		return nil
+	}
+	accounts := s.qualityRejectAccounts[conversationKey]
+	if accounts == nil {
+		return nil
+	}
+	rotated := make([]uint64, len(accounts))
+	copy(rotated, accounts)
+	return rotated
 }
 
 // qualityRejectLadderSuppressed reports whether this conversation was
