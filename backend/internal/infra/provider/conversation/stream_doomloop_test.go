@@ -159,6 +159,151 @@ func TestConvertResponsesStreamTracksSuppressedReasoning(t *testing.T) {
 	}
 }
 
+// Periodic loops repeat a whole multi-delta block instead of a single delta,
+// so the consecutive-delta counter never fires (it resets on every change).
+// This is the grok-4.7 "same sentence + Working" failure mode.
+func TestConvertResponsesStreamTerminatesPeriodicContentLoop(t *testing.T) {
+	block := []string{
+		`I'll measure the closed picker `,
+		`and the open menu on a phone width.`,
+		"\n",
+		`Working`,
+		"\n\n",
+	}
+	lines := []string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6","status":"in_progress"}}`, "",
+	}
+	// 5 repetitions: detection must fire on the 4th cycle at the latest.
+	for cycle := 0; cycle < 5; cycle++ {
+		for _, delta := range block {
+			lines = append(lines,
+				`event: response.output_text.delta`,
+				fmt.Sprintf(`data: {"type":"response.output_text.delta","delta":%q}`, delta), "")
+		}
+	}
+	lines = append(lines,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`, "", "")
+	_, err := io.ReadAll(ConvertResponseStream(
+		io.NopCloser(strings.NewReader(strings.Join(lines, "\n"))), OperationChat,
+	))
+	if err == nil {
+		t.Fatal("a periodically repeating visible block must terminate the stream")
+	}
+	if !strings.Contains(err.Error(), "model output loop detected") ||
+		!strings.Contains(err.Error(), "repeating sequence") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// Three repetitions alone are not conclusive (legitimate content can echo a
+// phrase a few times); the guard must let them through.
+func TestConvertResponsesStreamAllowsThreeBlockRepetitions(t *testing.T) {
+	block := []string{
+		`I'll measure the closed picker `,
+		`and the open menu on a phone width.`,
+		"\n\n",
+	}
+	lines := []string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6","status":"in_progress"}}`, "",
+	}
+	for cycle := 0; cycle < 3; cycle++ {
+		for _, delta := range block {
+			lines = append(lines,
+				`event: response.output_text.delta`,
+				fmt.Sprintf(`data: {"type":"response.output_text.delta","delta":%q}`, delta), "")
+		}
+	}
+	lines = append(lines,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`, "", "")
+	converted, err := io.ReadAll(ConvertResponseStream(
+		io.NopCloser(strings.NewReader(strings.Join(lines, "\n"))), OperationChat,
+	))
+	if err != nil {
+		t.Fatalf("three repetitions of a long block must not be treated as a loop: %v", err)
+	}
+	if !strings.Contains(string(converted), "data: [DONE]") {
+		t.Fatalf("stream did not complete: %s", converted)
+	}
+}
+
+// Short alternating blocks stay under minCycleChars, so markdown-like
+// repetition must not trip the periodic detector (the consecutive-delta
+// ceiling still applies to a single repeated delta).
+func TestConvertResponsesStreamAllowsShortPeriodicBlocks(t *testing.T) {
+	for _, testCase := range []struct{ name, delta string }{
+		{"short status marker", "Working"},
+		{"bullet line", "- item\n"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			lines := []string{
+				`event: response.created`,
+				`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6","status":"in_progress"}}`, "",
+			}
+			for i := 0; i < contentDoomLoopThreshold/2; i++ {
+				lines = append(lines,
+					`event: response.output_text.delta`,
+					fmt.Sprintf(`data: {"type":"response.output_text.delta","delta":%q}`, testCase.delta), "",
+					`event: response.output_text.delta`,
+					`data: {"type":"response.output_text.delta","delta":"\n"}`, "")
+			}
+			lines = append(lines,
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`, "", "")
+			converted, err := io.ReadAll(ConvertResponseStream(
+				io.NopCloser(strings.NewReader(strings.Join(lines, "\n"))), OperationChat,
+			))
+			if err != nil {
+				t.Fatalf("short periodic blocks must not be treated as a loop: %v", err)
+			}
+			if !strings.Contains(string(converted), "data: [DONE]") {
+				t.Fatalf("stream did not complete: %s", converted)
+			}
+		})
+	}
+}
+
+// A periodic reasoning loop (long phrases, not short markers) must also
+// terminate, while keeping the elevated cycle count for reasoning.
+func TestConvertResponsesStreamTerminatesPeriodicReasoningLoop(t *testing.T) {
+	block := []string{
+		`let me measure the picker again `,
+		`and compare with the menu width.`,
+		" ",
+	}
+	for _, event := range []string{"response.reasoning_text.delta", "response.reasoning_summary_text.delta"} {
+		t.Run(event, func(t *testing.T) {
+			lines := []string{
+				`event: response.created`,
+				`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6","status":"in_progress"}}`, "",
+			}
+			for cycle := 0; cycle < reasoningSequenceRepeatCycles+1; cycle++ {
+				for _, delta := range block {
+					lines = append(lines,
+						"event: "+event,
+						fmt.Sprintf(`data: {"type":%q,"item_id":"rs_1","delta":%q}`, event, delta), "")
+				}
+			}
+			lines = append(lines,
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`, "", "")
+			_, err := io.ReadAll(ConvertResponseStream(
+				io.NopCloser(strings.NewReader(strings.Join(lines, "\n"))), OperationChat,
+			))
+			if err == nil {
+				t.Fatal("a periodically repeating reasoning block must terminate the stream")
+			}
+			if !strings.Contains(err.Error(), "loop detected") ||
+				!strings.Contains(err.Error(), "repeating sequence") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestConvertResponsesStreamDoesNotCountFlushedSummaryTwice(t *testing.T) {
 	repeats := (contentDoomLoopThreshold + reasoningDoomLoopThreshold) / 2
 	lines := []string{

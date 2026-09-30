@@ -25,6 +25,26 @@ const (
 	// 同一短标记（"so"、"hmm"、"wait"、列表符号）。共用低阈值会过早终止
 	// 有效的深度推理响应。
 	reasoningDoomLoopThreshold = 256
+
+	// 周期性循环检测：连续相同增量的计数器只捕获"恒定"重复，
+	// 而真实的模型死循环往往周期性地重复一整段多增量文本（例如同一句
+	// 话 + 工具状态反复出现）。sequenceRepeatCycles 个连续相同的增量
+	// 块视为循环。
+	sequenceRepeatCycles = 4
+
+	// reasoningSequenceRepeatCycles 高于内容：推理中较长的短语级重复更常见。
+	reasoningSequenceRepeatCycles = 6
+
+	// maxCycleDeltas 限制单周期内的增量数上限，同时约束检测成本。
+	maxCycleDeltas = 48
+
+	// minCycleChars 单个周期块的字符数下限。低于该值的块（markdown 分隔
+	// 线 "-"、"="、表格单元 " | "、短推理标记 "hmm"）属于合法重复，交由
+	// 连续增量阈值处理。
+	minCycleChars = 16
+
+	// cycleHistoryCap 只需保留最近 sequenceRepeatCycles*maxCycleDeltas 个增量。
+	cycleHistoryCap = sequenceRepeatCycles * maxCycleDeltas
 )
 
 // ConvertResponseStream 将 Responses SSE 转换为 Chat Completions 或 Anthropic Messages SSE。
@@ -91,6 +111,8 @@ type streamRepeatTracker struct {
 	contentRepeatCount int
 	lastReasonDelta    string
 	reasonRepeatCount  int
+	contentHistory     []string
+	reasonHistory      []string
 }
 
 // streamPipeReadCloser ensures a downstream cancellation immediately closes the
@@ -799,13 +821,13 @@ func (t *streamRepeatTracker) trackContent(delta string) error {
 	if delta != t.lastContentDelta {
 		t.lastContentDelta = delta
 		t.contentRepeatCount = 1
-		return nil
+	} else {
+		t.contentRepeatCount++
+		if t.contentRepeatCount > contentDoomLoopThreshold {
+			return fmt.Errorf("model output loop detected (repeated content delta %d times)", t.contentRepeatCount)
+		}
 	}
-	t.contentRepeatCount++
-	if t.contentRepeatCount > contentDoomLoopThreshold {
-		return fmt.Errorf("model output loop detected (repeated content delta %d times)", t.contentRepeatCount)
-	}
-	return nil
+	return t.trackCycle(&t.contentHistory, delta, sequenceRepeatCycles, "model output loop detected")
 }
 
 func (t *streamRepeatTracker) trackReasoning(delta, message string) error {
@@ -815,13 +837,74 @@ func (t *streamRepeatTracker) trackReasoning(delta, message string) error {
 	if delta != t.lastReasonDelta {
 		t.lastReasonDelta = delta
 		t.reasonRepeatCount = 1
-		return nil
+	} else {
+		t.reasonRepeatCount++
+		if t.reasonRepeatCount > reasoningDoomLoopThreshold {
+			return fmt.Errorf("%s (repeated delta %d times)", message, t.reasonRepeatCount)
+		}
 	}
-	t.reasonRepeatCount++
-	if t.reasonRepeatCount > reasoningDoomLoopThreshold {
-		return fmt.Errorf("%s (repeated delta %d times)", message, t.reasonRepeatCount)
+	return t.trackCycle(&t.reasonHistory, delta, reasoningSequenceRepeatCycles, message)
+}
+
+// trackCycle 检测周期性重复：当最近 cycles*L 个增量构成一个长度为 L 的
+// 块连续重复 cycles 次，且该块是最小周期、内容足够长（≥minCycleChars）时
+// 判定为循环。只看最小周期，避免把 "-"、"a"/"b"、"Working"/"\n" 这类短周期
+// 在 L 的整数倍上重新算成超长块。L 限制在 1..maxCycleDeltas，历史窗口按需裁剪。
+func (t *streamRepeatTracker) trackCycle(history *[]string, delta string, cycles int, loopPrefix string) error {
+	*history = append(*history, delta)
+	if len(*history) > cycles*maxCycleDeltas {
+		*history = (*history)[len(*history)-cycles*maxCycleDeltas:]
+	}
+	n := len(*history)
+	h := *history
+	for L := 1; L <= maxCycleDeltas && cycles*L <= n; L++ {
+		if !sequenceRepeats(h, n, L, cycles) {
+			continue
+		}
+		// A longer hit that is just k copies of a shorter period is the same
+		// loop. The shorter period was already considered; if it was too small
+		// to count, its multiples must not count either.
+		if L > 1 && hasProperDivisorPeriod(h, n, L, cycles) {
+			continue
+		}
+		if periodChars(h, n-cycles*L, L) < minCycleChars {
+			continue
+		}
+		return fmt.Errorf("%s (repeating sequence of %d deltas x %d)", loopPrefix, L, cycles)
 	}
 	return nil
+}
+
+func sequenceRepeats(history []string, n, period, cycles int) bool {
+	base := n - cycles*period
+	for c := 1; c < cycles; c++ {
+		for i := 0; i < period; i++ {
+			if history[base+c*period+i] != history[base+i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func hasProperDivisorPeriod(history []string, n, period, cycles int) bool {
+	for d := 1; d < period; d++ {
+		if period%d != 0 {
+			continue
+		}
+		if sequenceRepeats(history, n, d, cycles*period/d) {
+			return true
+		}
+	}
+	return false
+}
+
+func periodChars(history []string, base, period int) int {
+	chars := 0
+	for i := 0; i < period; i++ {
+		chars += len(history[base+i])
+	}
+	return chars
 }
 
 // guardResponseStream 保持 native Responses SSE 的原始字节不变，同时在读取时
